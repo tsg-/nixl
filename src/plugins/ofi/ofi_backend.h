@@ -52,10 +52,17 @@ public:
 class nixlOfiRequest : public nixlBackendReqH {
 public:
     fid_cq *cq;
-    std::atomic<uint64_t> wr_id;  // CRITICAL FIX: Atomic completion tracking
-
+    std::atomic<uint64_t> wr_id;
+    
+    // context management for proper cleanup
+    std::vector<uint64_t*> active_contexts;
+    std::mutex context_lock;
+    
     nixlOfiRequest() : cq(nullptr), wr_id(0) { }
-    ~nixlOfiRequest() { }
+    ~nixlOfiRequest() { cleanup_contexts(); }
+    
+private:
+    void cleanup_contexts();
 };
 
 class nixlOfiEngine : public nixlBackendEngine {
@@ -156,6 +163,15 @@ private:
     nixl_status_t registerDramMemory(const nixlBlobDesc &mem, nixlOfiMetadata *ofi_meta) const;
     nixl_status_t registerHmemMemory(const nixlBlobDesc &mem, nixlOfiMetadata *ofi_meta, fi_hmem_iface iface, uint64_t device_id) const;
 
+    // helper methods
+    nixl_status_t handleCQError(fid_cq* cq, int error_ret) const;
+    uint64_t getRemoteKey(nixlOfiMetadata* remote_meta) const;
+    
+    // RDM readiness synchronization helpers
+    void markLocalReady();
+    void markRemoteReady(const std::string& remote_agent);
+    bool areBothReady(const std::string& remote_agent) const;
+
     // data members
     fid_fabric *fabric_;
     fid_domain *domain_;
@@ -164,7 +180,7 @@ private:
     fid_eq *eq_;
     fid_pep *pep_;
     struct fi_info *fi_;
-
+    
     std::string providerName_;
     struct fi_info *cachedProviderInfo_;
     std::string localAddr_;
@@ -174,6 +190,11 @@ private:
     fid_av *av_;
     mutable std::mutex epLock_;
     bool isConnectionless_;
+    
+    // RDM endpoint readiness synchronization
+    mutable std::map<std::string, bool> remoteReadiness_;
+    mutable std::mutex readinessMutex_;
+    bool localReady_;
 
     std::thread eqThread_;
     std::atomic<bool> eqThreadStop_;
