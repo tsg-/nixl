@@ -170,7 +170,7 @@ private:
     std::string localAddr_;
     mutable std::map<std::string, std::string> remoteAddrs_;
     mutable std::map<std::string, fid_ep *> connectedEps_;
-    mutable std::map<std::string, fi_addr_t> shmAddrs_;
+    mutable std::map<std::string, fi_addr_t> avAddrs_;
     fid_av *av_;
     mutable std::mutex epLock_;
     bool isConnectionless_;

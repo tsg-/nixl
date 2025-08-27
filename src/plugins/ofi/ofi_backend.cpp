@@ -486,7 +486,7 @@ nixl_status_t nixlOfiEngine::connect_unlocked(const std::string &remote_agent) {
 
     if (isConnectionless_) {
         // for connectionless providers like shm: insert remote address into av
-        if (shmAddrs_.count(remote_agent)) {
+        if (avAddrs_.count(remote_agent)) {
             NIXL_DEBUG << "Already have address mapping for " << remote_agent;
             return NIXL_SUCCESS;
         }
@@ -504,7 +504,7 @@ nixl_status_t nixlOfiEngine::connect_unlocked(const std::string &remote_agent) {
             return NIXL_ERR_BACKEND;
         }
 
-        shmAddrs_[remote_agent] = addr;
+        avAddrs_[remote_agent] = addr;
         NIXL_DEBUG << "OFI backend: Added address mapping for " << remote_agent;
         return NIXL_SUCCESS;
     }
@@ -634,8 +634,8 @@ nixl_status_t nixlOfiEngine::disconnect(const std::string &remote_agent) {
 
     if (isConnectionless_) {
         // connectionless provider, remove address mapping
-        auto it = shmAddrs_.find(remote_agent);
-        if (it == shmAddrs_.end()) {
+        auto it = avAddrs_.find(remote_agent);
+        if (it == avAddrs_.end()) {
             NIXL_WARN << "OFI backend: No address mapping for " << remote_agent;
             return NIXL_ERR_NOT_FOUND;
         }
@@ -646,7 +646,7 @@ nixl_status_t nixlOfiEngine::disconnect(const std::string &remote_agent) {
             return NIXL_ERR_BACKEND;
         }
 
-        shmAddrs_.erase(it);
+        avAddrs_.erase(it);
         NIXL_DEBUG << "OFI backend: Removed address mapping for " << remote_agent;
         return NIXL_SUCCESS;
     }
@@ -788,8 +788,8 @@ nixl_status_t nixlOfiEngine::postXfer(const nixl_xfer_op_t &operation,
     fi_addr_t dest_addr = FI_ADDR_UNSPEC;
 
     if (isConnectionless_) {
-        auto shm_it = shmAddrs_.find(remote_agent);
-        if (shm_it == shmAddrs_.end()) {
+        auto shm_it = avAddrs_.find(remote_agent);
+        if (shm_it == avAddrs_.end()) {
             // CRITICAL FIX: Connection should have been established in loadRemoteConnInfo
             // If we reach here, it means the connection was not properly established
             NIXL_ERROR << "No address mapping found for " << remote_agent 
