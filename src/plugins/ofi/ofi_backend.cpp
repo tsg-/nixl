@@ -1653,7 +1653,7 @@ nixl_status_t nixlOfiEngine::registerSynapseAIMemoryExplicit(const nixlBlobDesc 
 
     // Calculate aligned buffer size
     const size_t ACCEL_PAGE_SIZE = 4096;
-    size_t buf_size = (mem.len + ACCEL_PAGE_SIZE - 1) & ~(ACCEL_PAGE_SIZE - 1);
+    size_t modi_memlen = mem.len;
     
     // Check if memory is within device range
     uint64_t hbm_base = device_info.globalHbmBaseAddress;
@@ -1670,17 +1670,28 @@ nixl_status_t nixlOfiEngine::registerSynapseAIMemoryExplicit(const nixlBlobDesc 
         return NIXL_ERR_INVALID_PARAM;
     }
     
-    // Get dmabuf fd
+    // Align device offset to suit page size
     uint64_t device_offset = mem.addr - hbm_base;
-    NIXL_DEBUG << "Exporting dmabuf: fd=" << device_info.fd 
+    uint64_t modi_mem_addr;
+    if (mem.addr % ACCEL_PAGE_SIZE) {
+        modi_mem_addr = (mem.addr / ACCEL_PAGE_SIZE) * ACCEL_PAGE_SIZE;
+        device_offset -= mem.addr - modi_mem_addr;
+        modi_memlen += ACCEL_PAGE_SIZE;
+    }
+    modi_memlen = (modi_memlen + ACCEL_PAGE_SIZE - 1) & ~(ACCEL_PAGE_SIZE - 1);
+
+    NIXL_INFO << "Exporting dmabuf: fd=" << device_info.fd
               << " base=0x" << std::hex << hbm_base 
-              << " size=" << std::dec << buf_size 
+              << " size=" << std::dec << modi_memlen
+              << " tensor data ptr=0x" << std::hex << mem.addr
+              << " modified tensor data ptr=0x" << std::hex << modi_mem_addr
               << " offset=0x" << std::hex << device_offset;
-    
+
+    // Get dmabuf fd
     int dmabuf_fd = synapseai_ops_.hlthunk_device_mapped_memory_export_dmabuf_fd(
         device_info.fd,
         hbm_base,
-        buf_size,
+        modi_memlen,
         device_offset,
         (O_RDWR | O_CLOEXEC)
     );
@@ -1689,7 +1700,7 @@ nixl_status_t nixlOfiEngine::registerSynapseAIMemoryExplicit(const nixlBlobDesc 
         NIXL_ERROR << "hlthunk_device_mapped_memory_export_dmabuf_fd failed: " << strerror(-dmabuf_fd);
         NIXL_ERROR << "  device_fd=" << device_info.fd;
         NIXL_ERROR << "  base_addr=0x" << std::hex << hbm_base;
-        NIXL_ERROR << "  size=" << std::dec << buf_size;
+        NIXL_ERROR << "  size=" << std::dec << modi_memlen;
         NIXL_ERROR << "  offset=0x" << std::hex << device_offset;
         return NIXL_ERR_BACKEND;
     }
@@ -1702,8 +1713,8 @@ nixl_status_t nixlOfiEngine::registerSynapseAIMemoryExplicit(const nixlBlobDesc 
     struct fi_mr_dmabuf dmabuf = {};
     dmabuf.fd = dmabuf_fd;
     dmabuf.offset = 0;                                   // kernel handled offset
-    dmabuf.len = mem.len;                                // exact buffer size
-    dmabuf.base_addr = reinterpret_cast<void*>(mem.addr); // exact buffer start
+    dmabuf.len = modi_memlen;                                // exact buffer size
+    dmabuf.base_addr = reinterpret_cast<void*>(modi_mem_addr); // exact buffer start
     
     // Set up memory registration attributes
     struct fi_mr_attr mr_attr = {};
