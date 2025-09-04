@@ -16,6 +16,7 @@
  */
 
 #include "ofi_backend.h"
+#include "ofi_utils.h"
 #include "common/nixl_log.h"
 #include <rdma/fi_errno.h>
 #include <rdma/fi_rma.h>
@@ -27,10 +28,8 @@
 
 #include <cstdlib>
 
-// static synapseAI handles for dynamic loading
-void* nixlOfiEngine::synapseai_handle_ = nullptr;
-void* nixlOfiEngine::hlthunk_handle_ = nullptr;
-nixlOfiEngine::synapseai_ops nixlOfiEngine::synapseai_ops_ = {};
+// static synapseAI library utilities
+static nixlOfiUtils::SynapseAILibs synapseaiLibs_;
 static std::mutex synapseai_init_mutex_;
 
 nixlOfiEngine::nixlOfiEngine(const nixlBackendInitParams* init_params) :
@@ -45,20 +44,16 @@ nixlOfiEngine::nixlOfiEngine(const nixlBackendInitParams* init_params) :
     eq_(nullptr),
     pep_(nullptr),
     fi_(nullptr),
+    hints_(nullptr),
     cachedProviderInfo_(nullptr),
     av_(nullptr),
     isConnectionless_(false),
     eqThreadStop_(false),
     eqThreadPaused_(false),
     eqTimeoutMs_(100),
-    hmemZeSupported_(false),
-    hmemCudaSupported_(false),
-    hmemSynapseaiSupported_(false)
+    hmemManager_(std::make_unique<nixlOfiHmemManager>())
 {
     localAgentName_ = init_params->localAgent;
-    struct fi_info *hints = nullptr;
-    struct fi_info *info = nullptr;
-    int ret = 0;
 
     // use FI_PROVIDER environment variable or fall back to sensible defaults
     const char* env_provider = getenv("FI_PROVIDER");
@@ -92,94 +87,13 @@ nixlOfiEngine::nixlOfiEngine(const nixlBackendInitParams* init_params) :
     // get EQ timeout parameter (0-60 seconds max)
     getLongParam(init_params, "eq_timeout_ms", eqTimeoutMs_, 0, 60000);
 
-    hints = fi_allocinfo();
-    if (!hints) {
-        this->initErr = true;
-        NIXL_ERROR << "fi_allocinfo failed";
-        return;
-    }
-
-    // HMEM determination strategy:
-    // 1 environment variables: HMEM=1 (auto-detect), HMEM_SYNAPSEAI=1, HMEM_CUDA=1, HMEM_ZE=1
-    // 2 application registers VRAM memory type during registerMem() call
-    // 3 device discovery during registration if not overridden
-    
-    bool need_hmem = false;
-    
-    // check HMEM environment variables
-    auto isEnvTrue = [](const char* env_val) -> bool {
-        return env_val && (strcmp(env_val, "1") == 0 || strcmp(env_val, "true") == 0);
-    };
-    
-    const char* hmem_vars[] = {"HMEM_SYNAPSEAI", "HMEM_CUDA", "HMEM_ZE", "HMEM"};
-    const char* hmem_names[] = {"SynapseAI", "CUDA", "ZE", "auto-detection"};
-    
-    for (size_t i = 0; i < 4; ++i) {
-        const char* env_val = getenv(hmem_vars[i]);
-        if (isEnvTrue(env_val)) {
-            need_hmem = true;
-            NIXL_DEBUG << "HMEM forced to " << hmem_names[i] << " via " << hmem_vars[i] << " environment variable";
-            break;
-        }
-    }
-
-    NIXL_INFO << "HMEM support requested: " << (need_hmem ? "YES" : "NO");
-
-    if (need_hmem) {
-        hints->caps |= FI_HMEM;
-        NIXL_DEBUG << "Adding FI_HMEM to hints->caps for device memory support";
-    } else {
-        NIXL_DEBUG << "HMEM not enabled - DRAM memory only";
-    }
-
-    // for shm, tcp, and rxm providers, use minimal configuration (only provider name)
-    if (providerName_ == "shm" || providerName_ == "tcp" || 
-        providerName_ == "tcp;ofi_rxm" || providerName_ == "verbs;ofi_rxm") {
-        hints->fabric_attr->prov_name = strdup(providerName_.c_str());
-        NIXL_DEBUG << "Using minimal auto-negotiated hints for " << providerName_ << " provider";
-    } else {
-        // for other providers, use predefined configuration from SUPPORTED_PROVIDERS  
-        configureHintsForProvider(hints, providerName_);
-    }
-
-    // debug print all hints
-    NIXL_INFO << "=== constructor: fi_getinfo hints ===";
-    NIXL_INFO << "provider name: " << hints->fabric_attr->prov_name;
-    NIXL_INFO << "caps: " << fi_tostr(&hints->caps, FI_TYPE_CAPS);
-    NIXL_INFO << "mode: " << fi_tostr(&hints->mode, FI_TYPE_MODE);
-    NIXL_INFO << "ep_attr->type: " << fi_tostr(&hints->ep_attr->type, FI_TYPE_EP_TYPE);
-    NIXL_INFO << "domain_attr->mr_mode: " << fi_tostr(&hints->domain_attr->mr_mode, FI_TYPE_MR_MODE);
-    NIXL_INFO << "domain_attr->resource_mgmt: " << hints->domain_attr->resource_mgmt;
-    NIXL_INFO << "addr_format: " << fi_tostr(&hints->addr_format, FI_TYPE_ADDR_FORMAT);
-    NIXL_INFO << "========================";
-
-    // let libfabric choose optimal settings; only override if explicitly needed
-
-    ret = fi_getinfo(FI_VERSION(1, 20), nullptr, nullptr, 0, hints, &info);
-    if (ret) {
-        NIXL_ERROR << "fi_getinfo failed: " << fi_strerror(-ret);
-        NIXL_DEBUG << "Trying fi_getinfo with minimal hints for provider " << providerName_;
-        
-        // minimal hints, see what provider supports
-        struct fi_info *minimal_hints = fi_allocinfo();
-        if (minimal_hints) {
-            minimal_hints->fabric_attr->prov_name = strdup(providerName_.c_str());
-            struct fi_info *minimal_fi = nullptr;
-            int minimal_ret = fi_getinfo(FI_VERSION(1, 18), nullptr, nullptr, 0, minimal_hints, &minimal_fi);
-            if (minimal_ret == 0) {
-                NIXL_DEBUG << "Provider " << providerName_ << " supports: caps=0x" << std::hex << minimal_fi->caps 
-                         << " ep_type=" << minimal_fi->ep_attr->type;
-                fi_freeinfo(minimal_fi);
-            } else {
-                NIXL_ERROR << "Even minimal fi_getinfo failed: " << fi_strerror(-minimal_ret);
-            }
-            fi_freeinfo(minimal_hints);
-        }
+    // initialize OFI with provider-specific configuration
+    nixl_status_t init_status = initializeOFI();
+    if (init_status != NIXL_SUCCESS) {
         goto cleanup_teardown;
     }
 
-    // use the first provider returned by fi_getinfo (highest performance)
-    fi_ = info;
+    // fi_ was assigned in performFiGetinfo(), verify it was successful
     if (!fi_) {
         NIXL_ERROR << "No providers returned by fi_getinfo";
         goto cleanup_teardown;
@@ -208,20 +122,20 @@ nixlOfiEngine::nixlOfiEngine(const nixlBackendInitParams* init_params) :
                    << " isConnectionless=" << isConnectionless_;
     }
 
-    // detect HMEM capabilities for this provider
-    detectHmemCapabilities(fi_, providerName_, hmemCudaSupported_,
-                           hmemZeSupported_, hmemSynapseaiSupported_);
+    // HMEM capabilities are now managed by hmemManager_
 
-    ret = fi_fabric(fi_->fabric_attr, &fabric_, nullptr);
-    if (ret) {
-        NIXL_ERROR << "fi_fabric failed: " << fi_strerror(-ret);
-        goto cleanup_teardown;
-    }
+    {
+        int ret = fi_fabric(fi_->fabric_attr, &fabric_, nullptr);
+        if (ret) {
+            NIXL_ERROR << "fi_fabric failed: " << fi_strerror(-ret);
+            goto cleanup_teardown;
+        }
 
-    ret = fi_domain(fabric_, fi_, &domain_, nullptr);
-    if (ret) {
-        NIXL_ERROR << "fi_domain failed: " << fi_strerror(-ret);
-        goto cleanup_teardown;
+        ret = fi_domain(fabric_, fi_, &domain_, nullptr);
+        if (ret) {
+            NIXL_ERROR << "fi_domain failed: " << fi_strerror(-ret);
+            goto cleanup_teardown;
+        }
     }
 
     {
@@ -261,8 +175,7 @@ nixlOfiEngine::nixlOfiEngine(const nixlBackendInitParams* init_params) :
         NIXL_WARN << "Failed to duplicate provider info for caching";
     }
 
-    fi_freeinfo(hints);
-    // Don't free info here since fi_ = info (line 161), it will be freed in destructor
+    // hints_ will be freed in cleanup, fi_ will be freed in destructor
 
     NIXL_DEBUG << "Starting EQ event loop ...: connectionless=" << isConnectionless_;
     // start event loop thread for connection-oriented providers
@@ -286,8 +199,8 @@ cleanup_teardown:
     if (cq_)        { fi_close(&cq_->fid);        cq_ = nullptr; }
     if (domain_) { fi_close(&domain_->fid); domain_ = nullptr; }
     if (fabric_) { fi_close(&fabric_->fid); fabric_ = nullptr; }
-    if (fi_)     { fi_freeinfo(fi_);        fi_ = nullptr; info = nullptr; }
-    if (hints)   { fi_freeinfo(hints);      hints = nullptr; }
+    if (fi_)     { fi_freeinfo(fi_);        fi_ = nullptr; }
+    if (hints_)  { fi_freeinfo(hints_);     hints_ = nullptr; }
     this->initErr = true;
 }
 
@@ -508,13 +421,13 @@ nixl_status_t nixlOfiEngine::genNotif(const std::string &remote_agent, const std
 nixl_mem_list_t nixlOfiEngine::getSupportedMems() const {
     nixl_mem_list_t mems;
     mems.push_back(DRAM_SEG);
-    if (hmemCudaSupported_) {
+    if (hmemManager_->isCudaSupported()) {
         mems.push_back(VRAM_SEG);
     }
-    if (hmemSynapseaiSupported_) {
+    if (hmemManager_->isSynapseaiSupported()) {
         mems.push_back(VRAM_SEG);
     }
-    if (hmemZeSupported_) {
+    if (hmemManager_->isZeSupported()) {
         mems.push_back(VRAM_SEG);
     }
     return mems;
@@ -746,7 +659,7 @@ nixl_status_t nixlOfiEngine::registerMem(const nixlBlobDesc &mem,
     if (nixl_mem == DRAM_SEG) {
         status = registerDramMemory(mem, ofi_meta);
     } else if (nixl_mem == VRAM_SEG) {
-        status = registerVramMemory(mem, ofi_meta);
+        status = hmemManager_->registerVramMemory(mem, ofi_meta, fi_, domain_);
     } else {
         NIXL_ERROR << "Unsupported memory type: " << nixl_mem;
         delete ofi_meta;
@@ -1179,8 +1092,8 @@ nixl_status_t nixlOfiEngine::loadRemoteConnInfo(const std::string &remote_agent,
     NIXL_DEBUG << "loadRemoteConnInfo: storing conn_info for " << remote_agent << " size=" << conn_info.size();
     remoteAddrs_[remote_agent] = conn_info;
     
-    // CRITICAL FIX: Establish connection immediately when remote agent info is loaded
-    // This prevents data integrity issues caused by auto-connect during first transfer
+    // establish connection immediately when remote agent info is loaded
+    // this prevents data integrity issues caused by auto-connect during first transfer
     NIXL_DEBUG << "Establishing connection to " << remote_agent << " immediately";
     nixl_status_t connect_status = connect_unlocked(remote_agent);
     if (connect_status != NIXL_SUCCESS) {
@@ -1568,47 +1481,10 @@ void nixlOfiEngine::detectHmemCapabilities(struct fi_info* fi_info,
     NIXL_DEBUG << "HMEM interfaces marked as potentially available - runtime detection will validate";
 }
 
-uint64_t nixlOfiEngine::getMemoryRegistrationAccessFlags(const struct fi_info* fi_info) {
-    uint64_t access_flags = FI_REMOTE_READ | FI_REMOTE_WRITE | FI_SEND | FI_RECV;
-    
-    if (fi_info && fi_info->domain_attr) {
-        if (fi_info->caps & FI_READ) access_flags |= FI_READ;
-        if (fi_info->caps & FI_WRITE) access_flags |= FI_WRITE;
-        if (fi_info->caps & FI_RMA) {
-            access_flags |= FI_READ | FI_WRITE;
-        }
-    }
-    
-    return access_flags;
-}
 
-fi_hmem_iface nixlOfiEngine::selectHmemInterface(const nixlBlobDesc &mem, uint64_t &device_id) const {
+fi_hmem_iface nixlOfiHmemManager::selectHmemInterface(const nixlBlobDesc &mem, uint64_t &device_id) const {
     device_id = mem.devId >= 0 ? mem.devId : 0;
     
-    // helper for safe environment variable checking
-    auto isEnvTrue = [](const char* env_val) -> bool {
-        return env_val && (strcmp(env_val, "1") == 0 || strcmp(env_val, "true") == 0);
-    };
-    
-    // Synapse device validation
-    auto validateSynapseAIDevice = [](uint64_t dev_id) -> bool {
-        std::string device_path = "/dev/accel/accel" + std::to_string(dev_id);
-        if (access(device_path.c_str(), R_OK | W_OK) != 0) {
-            NIXL_INFO << "SynapseAI device " << device_path << " not accessible, will fallback to system memory";
-            return false;
-        }
-        return true;
-    };
-    
-    auto validateCudaDevice = [](uint64_t dev_id) -> bool {
-        // TODO: add proper CUDA device validation
-        return true;
-    };
-    
-    auto validateZeDevice = [](uint64_t dev_id) -> bool {
-        // TODO: add proper ZE device validation
-        return true;
-    };
     
     // HMEM interface configuration
     struct HmemConfig {
@@ -1627,7 +1503,7 @@ fi_hmem_iface nixlOfiEngine::selectHmemInterface(const nixlBlobDesc &mem, uint64
             "SynapseAI",
             "HMEM_SYNAPSEAI", 
             "HABANA_VISIBLE_DEVICES",
-            validateSynapseAIDevice
+            nixlOfiUtils::validateSynapseAIDevice
         },
         {
             FI_HMEM_CUDA, 
@@ -1635,7 +1511,7 @@ fi_hmem_iface nixlOfiEngine::selectHmemInterface(const nixlBlobDesc &mem, uint64
             "CUDA",
             "HMEM_CUDA", 
             "CUDA_VISIBLE_DEVICES",
-            validateCudaDevice
+            nixlOfiUtils::validateCudaDevice
         },
         {
             FI_HMEM_ZE, 
@@ -1643,14 +1519,14 @@ fi_hmem_iface nixlOfiEngine::selectHmemInterface(const nixlBlobDesc &mem, uint64
             "ZE",
             "HMEM_ZE", 
             "ZE_AFFINITY_MASK",
-            validateZeDevice
+            nixlOfiUtils::validateZeDevice
         }
     };
     
     // 1 check explicit environment variable overrides first
     for (const auto& config : configs) {
         const char* explicit_env = getenv(config.explicit_env);
-        if (isEnvTrue(explicit_env)) {
+        if (nixlOfiUtils::isEnvTrue(explicit_env)) {
             if (!config.supported) {
                 NIXL_ERROR << config.explicit_env << " set but " << config.name 
                           << " interface not supported by provider";
@@ -1707,21 +1583,34 @@ nixl_status_t nixlOfiEngine::registerDramMemory(const nixlBlobDesc &mem, nixlOfi
     
     // Check if this is actually device memory (HPU) that should use HMEM
     uint64_t device_id = 0;
-    fi_hmem_iface iface = selectHmemInterface(mem, device_id);
+    fi_hmem_iface iface = hmemManager_->selectHmemInterface(mem, device_id);
     
     if (iface != FI_HMEM_SYSTEM) {
         if (iface == FI_HMEM_SYNAPSEAI) {
             // Use explicit SynapseAI registration to avoid hcclLookupDMABuff segfault
             NIXL_DEBUG << "DRAM_SEG memory detected as SynapseAI device memory, using explicit dmabuf registration";
-            return registerSynapseAIMemoryExplicit(mem, ofi_meta);
+            nixl_status_t synapse_status = hmemManager_->registerSynapseAIMemoryExplicit(mem, ofi_meta, fi_, domain_);
+            if (synapse_status != NIXL_SUCCESS) {
+                NIXL_WARN << "SynapseAI explicit registration failed, falling back to standard DRAM registration";
+                // fall through to standard DRAM registration
+            } else {
+                return synapse_status;
+            }
+        } else {
+            // This is actually device memory, use HMEM registration
+            NIXL_DEBUG << "DRAM_SEG memory detected as device memory, using HMEM registration";
+            nixl_status_t vram_status = hmemManager_->registerVramMemory(mem, ofi_meta, fi_, domain_);
+            if (vram_status != NIXL_SUCCESS) {
+                NIXL_WARN << "VRAM registration failed, falling back to standard DRAM registration";
+                // fall through to standard DRAM registration
+            } else {
+                return vram_status;
+            }
         }
-        // This is actually device memory, use HMEM registration
-        NIXL_DEBUG << "DRAM_SEG memory detected as device memory, using HMEM registration";
-        return registerVramMemory(mem, ofi_meta);
     }
     
     // Standard host DRAM registration
-    uint64_t access_flags = getMemoryRegistrationAccessFlags(fi_);
+    uint64_t access_flags = nixlOfiUtils::getMemoryRegistrationAccessFlags(fi_);
     
     int ret = fi_mr_reg(domain_, reinterpret_cast<void*>(mem.addr), mem.len,
                        access_flags, 0, 0, 0, &ofi_meta->mr, nullptr);
@@ -1747,7 +1636,8 @@ nixl_status_t nixlOfiEngine::registerDramMemory(const nixlBlobDesc &mem, nixlOfi
 }
 
 
-nixl_status_t nixlOfiEngine::registerSynapseAIMemoryExplicit(const nixlBlobDesc &mem, nixlOfiMetadata *ofi_meta) const {
+nixl_status_t nixlOfiHmemManager::registerSynapseAIMemoryExplicit(const nixlBlobDesc &mem, nixlOfiMetadata *ofi_meta,
+                                                                 const struct fi_info* fi_info, fid_domain *domain) const {
     // Try to get device info from the memory descriptor first
     // If mem.devId is a valid SynapseAI device handle, use it directly
     synDeviceId device_id = static_cast<synDeviceId>(mem.devId);
@@ -1759,41 +1649,15 @@ nixl_status_t nixlOfiEngine::registerSynapseAIMemoryExplicit(const nixlBlobDesc 
     // thread-safe initialization of static handles
     std::lock_guard<std::mutex> lock(synapseai_init_mutex_);
     
-    // load synapseAI library functions (shared across instances)
-    if (!synapseai_handle_) {
-        synapseai_handle_ = dlopen("libSynapse.so", RTLD_NOW);
-        if (!synapseai_handle_) {
-            NIXL_ERROR << "failed to dlopen libSynapse.so: " << dlerror();
-            return NIXL_ERR_BACKEND;
-        }
-        
-        synapseai_ops_.synDeviceGetInfoV2 = 
-            (synStatus (*)(const synDeviceId, synDeviceInfoV2 *))dlsym(synapseai_handle_, "synDeviceGetInfoV2");
-        if (!synapseai_ops_.synDeviceGetInfoV2) {
-            NIXL_ERROR << "failed to find synDeviceGetInfoV2: " << dlerror();
-            return NIXL_ERR_BACKEND;
-        }
-    }
-    
-    if (!hlthunk_handle_) {
-        hlthunk_handle_ = dlopen("libhl-thunk.so", RTLD_NOW);
-        if (!hlthunk_handle_) {
-            NIXL_ERROR << "failed to dlopen libhl-thunk.so: " << dlerror();
-            return NIXL_ERR_BACKEND;
-        }
-        
-        synapseai_ops_.hlthunk_device_mapped_memory_export_dmabuf_fd = 
-            (int (*)(int, uint64_t, uint64_t, uint64_t, uint32_t))dlsym(hlthunk_handle_, "hlthunk_device_mapped_memory_export_dmabuf_fd");
-        if (!synapseai_ops_.hlthunk_device_mapped_memory_export_dmabuf_fd) {
-            NIXL_ERROR << "failed to find hlthunk_device_mapped_memory_export_dmabuf_fd: " << dlerror();
-            return NIXL_ERR_BACKEND;
-        }
+    // load synapseAI library functions using utility
+    if (!nixlOfiUtils::loadSynapseAILibraries(synapseaiLibs_)) {
+        return NIXL_ERR_BACKEND;
     }
     
     // Check if device is available first
-    if (synapseai_ops_.synDeviceGetInfoV2(device_id, &device_info) != synSuccess) {
-        NIXL_INFO << "SynapseAI device " << device_id << " not available, falling back to DRAM registration";
-        return registerDramMemory(mem, ofi_meta);
+    if (synapseaiLibs_.ops.synDeviceGetInfoV2(device_id, &device_info) != synSuccess) {
+        NIXL_INFO << "SynapseAI device " << device_id << " not available, falling back to system memory";
+        return NIXL_ERR_NOT_SUPPORTED;
     }
     
     NIXL_INFO << "Using existing SynapseAI device (PyTorch initialized) ID: " << device_id;
@@ -1835,7 +1699,7 @@ nixl_status_t nixlOfiEngine::registerSynapseAIMemoryExplicit(const nixlBlobDesc 
               << " offset=0x" << std::hex << device_offset;
     
     // Get dmabuf fd
-    int dmabuf_fd = synapseai_ops_.hlthunk_device_mapped_memory_export_dmabuf_fd(
+    int dmabuf_fd = synapseaiLibs_.ops.hlthunk_device_mapped_memory_export_dmabuf_fd(
         device_info.fd,
         hbm_base,
         modi_memlen,
@@ -1868,14 +1732,14 @@ nixl_status_t nixlOfiEngine::registerSynapseAIMemoryExplicit(const nixlBlobDesc 
     struct fi_mr_attr mr_attr = {};
     mr_attr.dmabuf = &dmabuf;
     mr_attr.iov_count = 1;
-    mr_attr.access = getMemoryRegistrationAccessFlags(fi_);
+    mr_attr.access = nixlOfiUtils::getMemoryRegistrationAccessFlags(fi_info);
     mr_attr.iface = FI_HMEM_SYNAPSEAI;
     mr_attr.device.synapseai = static_cast<uint32_t>(device_id);
     
     NIXL_DEBUG << "Registering SynapseAI memory with explicit dmabuf fd: " << dmabuf_fd;
     
     // register memory with explicit dmabuf
-    int ret = fi_mr_regattr(domain_, &mr_attr, FI_MR_DMABUF, &ofi_meta->mr);
+    int ret = fi_mr_regattr(domain, &mr_attr, FI_MR_DMABUF, &ofi_meta->mr);
     
     // cleanup fd after registration
     close(dmabuf_fd);
@@ -1899,8 +1763,9 @@ nixl_status_t nixlOfiEngine::registerSynapseAIMemoryExplicit(const nixlBlobDesc 
     return NIXL_SUCCESS;
 }
 
-nixl_status_t nixlOfiEngine::registerVramMemory(const nixlBlobDesc &mem, nixlOfiMetadata *ofi_meta) const {
-    if (!domain_) {
+nixl_status_t nixlOfiHmemManager::registerVramMemory(const nixlBlobDesc &mem, nixlOfiMetadata *ofi_meta, 
+                                                     const struct fi_info* fi_info, fid_domain *domain) const {
+    if (!domain) {
         NIXL_ERROR << "Domain not initialized";
         return NIXL_ERR_BACKEND;
     }
@@ -1918,20 +1783,20 @@ nixl_status_t nixlOfiEngine::registerVramMemory(const nixlBlobDesc &mem, nixlOfi
     
     mr_attr.mr_iov = &iov;
     mr_attr.iov_count = 1;
-    mr_attr.access = getMemoryRegistrationAccessFlags(fi_);
+    mr_attr.access = nixlOfiUtils::getMemoryRegistrationAccessFlags(fi_info);
     
     uint64_t device_id = 0;
     mr_attr.iface = selectHmemInterface(mem, device_id);
     
     if (mr_attr.iface == FI_HMEM_SYSTEM) {
-        NIXL_WARN << "VRAM requested but HMEM interface unavailable - falling back to system memory registration";
-        return registerDramMemory(mem, ofi_meta);
+        NIXL_WARN << "VRAM requested but HMEM interface unavailable - falling back to system memory";
+        return NIXL_ERR_BACKEND;
     }
 
     // Use explicit dmabuf registration for SynapseAI to avoid hcclLookupDMABuff segfault
     if (mr_attr.iface == FI_HMEM_SYNAPSEAI) {
         NIXL_DEBUG << "Using explicit SynapseAI dmabuf registration (fabtests approach)";
-        return registerSynapseAIMemoryExplicit(mem, ofi_meta);
+        return registerSynapseAIMemoryExplicit(mem, ofi_meta, fi_info, domain);
     }
     
     if (device_id >= UINT32_MAX) {
@@ -1955,11 +1820,11 @@ nixl_status_t nixlOfiEngine::registerVramMemory(const nixlBlobDesc &mem, nixlOfi
     }
     
     uint64_t reg_flags = 0;
-    if (fi_ && fi_->domain_attr && fi_->domain_attr->mr_mode) {
-        if (fi_->domain_attr->mr_mode & FI_MR_HMEM) {
+    if (fi_info && fi_info->domain_attr && fi_info->domain_attr->mr_mode) {
+        if (fi_info->domain_attr->mr_mode & FI_MR_HMEM) {
             reg_flags |= FI_HMEM_DEVICE_ONLY;
         }
-        NIXL_DEBUG << "Provider MR mode: 0x" << std::hex << fi_->domain_attr->mr_mode 
+        NIXL_DEBUG << "Provider MR mode: 0x" << std::hex << fi_info->domain_attr->mr_mode 
                   << " using reg_flags: 0x" << reg_flags;
     }
     
@@ -1967,7 +1832,7 @@ nixl_status_t nixlOfiEngine::registerVramMemory(const nixlBlobDesc &mem, nixlOfi
               << " access 0x" << std::hex << mr_attr.access 
               << " flags 0x" << reg_flags;
               
-    int ret = fi_mr_regattr(domain_, &mr_attr, reg_flags, &ofi_meta->mr);
+    int ret = fi_mr_regattr(domain, &mr_attr, reg_flags, &ofi_meta->mr);
     
     if (ret) {
         ofi_meta->mr = nullptr;
@@ -2089,5 +1954,137 @@ nixl_status_t nixlOfiEngine::handleCQError(fid_cq* cq, int error_ret) const {
         NIXL_ERROR << "fi_cq_read failed: " << fi_strerror(-error_ret);
     }
     return NIXL_ERR_BACKEND;
+}
+
+// nixlOfiHmemManager implementation
+
+nixlOfiHmemManager::nixlOfiHmemManager() : 
+    hmemZeSupported_(false),
+    hmemCudaSupported_(false), 
+    hmemSynapseaiSupported_(false) {
+    initializeHmemCapabilities();
+}
+
+nixlOfiHmemManager::~nixlOfiHmemManager() = default;
+
+bool nixlOfiHmemManager::determineHmemSupport() const {
+    auto isEnvTrue = [](const char* env_val) -> bool {
+        return env_val && (strcmp(env_val, "1") == 0 || strcmp(env_val, "true") == 0);
+    };
+    
+    const char* hmem_vars[] = {"HMEM_SYNAPSEAI", "HMEM_CUDA", "HMEM_ZE", "HMEM"};
+    const char* hmem_names[] = {"SynapseAI", "CUDA", "ZE", "auto-detection"};
+    
+    for (size_t i = 0; i < 4; ++i) {
+        const char* env_val = getenv(hmem_vars[i]);
+        if (isEnvTrue(env_val)) {
+            NIXL_DEBUG << "HMEM forced to " << hmem_names[i] << " via " << hmem_vars[i] << " environment variable";
+            return true;
+        }
+    }
+    
+    return false;
+}
+
+void nixlOfiHmemManager::initializeHmemCapabilities() {
+    hmemCudaSupported_ = true;
+    hmemZeSupported_ = true; 
+    hmemSynapseaiSupported_ = true;
+    
+    NIXL_DEBUG << "HMEM interfaces marked as potentially available - runtime detection will validate";
+}
+
+// OFI initialization helper functions
+
+nixl_status_t nixlOfiEngine::initializeOFI() {
+    // step 1: determine HMEM support requirements
+    bool need_hmem = hmemManager_->determineHmemSupport();
+    NIXL_INFO << "HMEM support requested: " << (need_hmem ? "YES" : "NO");
+    
+    // step 2: create and configure hints with all required capabilities
+    nixl_status_t status = createAndConfigureHints(need_hmem);
+    if (status != NIXL_SUCCESS) {
+        return status;
+    }
+    
+    // step 3: perform fi_getinfo with fallback handling
+    return performFiGetinfo();
+}
+
+
+nixl_status_t nixlOfiEngine::createAndConfigureHints(bool need_hmem) {
+    hints_ = fi_allocinfo();
+    if (!hints_) {
+        NIXL_ERROR << "fi_allocinfo failed";
+        return NIXL_ERR_BACKEND;
+    }
+
+    // set provider name first
+    hints_->fabric_attr->prov_name = strdup(providerName_.c_str());
+    
+    // configure provider-specific settings
+    if (providerName_ == "shm" || providerName_ == "tcp" || 
+        providerName_ == "tcp;ofi_rxm" || providerName_ == "verbs;ofi_rxm") {
+        NIXL_DEBUG << "Using minimal auto-negotiated hints for " << providerName_ << " provider";
+        // for RXM providers, start with minimal configuration and add capabilities
+    } else {
+        // for other providers, use predefined configuration from SUPPORTED_PROVIDERS  
+        configureHintsForProvider(hints_, providerName_);
+    }
+
+    // add HMEM support if requested
+    if (need_hmem) {
+        hints_->caps |= FI_HMEM;
+        NIXL_DEBUG << "Adding FI_HMEM to hints->caps for device memory support";
+    }
+
+    // force RMA capabilities
+    hints_->caps |= FI_RMA | FI_READ | FI_WRITE | FI_REMOTE_READ | FI_REMOTE_WRITE;
+    NIXL_INFO << "Adding RMA capabilities to hints: FI_RMA | FI_READ | FI_WRITE | FI_REMOTE_READ | FI_REMOTE_WRITE";
+
+    // debug print all configured hints
+    NIXL_INFO << "=== constructor: fi_getinfo hints ===";
+    NIXL_INFO << "provider name: " << hints_->fabric_attr->prov_name;
+    NIXL_INFO << "caps: " << fi_tostr(&hints_->caps, FI_TYPE_CAPS);
+    NIXL_INFO << "mode: " << fi_tostr(&hints_->mode, FI_TYPE_MODE);
+    NIXL_INFO << "ep_attr->type: " << fi_tostr(&hints_->ep_attr->type, FI_TYPE_EP_TYPE);
+    NIXL_INFO << "domain_attr->mr_mode: " << fi_tostr(&hints_->domain_attr->mr_mode, FI_TYPE_MR_MODE);
+    NIXL_INFO << "domain_attr->resource_mgmt: " << hints_->domain_attr->resource_mgmt;
+    NIXL_INFO << "addr_format: " << fi_tostr(&hints_->addr_format, FI_TYPE_ADDR_FORMAT);
+    NIXL_INFO << "========================";
+    
+    return NIXL_SUCCESS;
+}
+
+nixl_status_t nixlOfiEngine::performFiGetinfo() {
+    struct fi_info *info = nullptr;
+    
+    // let libfabric choose optimal settings; only override if explicitly needed
+    int ret = fi_getinfo(FI_VERSION(1, 20), nullptr, nullptr, 0, hints_, &info);
+    if (ret) {
+        NIXL_ERROR << "fi_getinfo failed: " << fi_strerror(-ret);
+        NIXL_DEBUG << "Trying fi_getinfo with minimal hints for provider " << providerName_;
+        
+        // fallback: try with minimal hints to see what provider supports
+        struct fi_info *minimal_hints = fi_allocinfo();
+        if (minimal_hints) {
+            minimal_hints->fabric_attr->prov_name = strdup(providerName_.c_str());
+            struct fi_info *minimal_fi = nullptr;
+            int minimal_ret = fi_getinfo(FI_VERSION(1, 18), nullptr, nullptr, 0, minimal_hints, &minimal_fi);
+            if (minimal_ret == 0) {
+                NIXL_DEBUG << "Provider " << providerName_ << " supports: caps=0x" << std::hex << minimal_fi->caps 
+                         << " ep_type=" << minimal_fi->ep_attr->type;
+                fi_freeinfo(minimal_fi);
+            } else {
+                NIXL_ERROR << "Even minimal fi_getinfo failed: " << fi_strerror(-minimal_ret);
+            }
+            fi_freeinfo(minimal_hints);
+        }
+        return NIXL_ERR_BACKEND;
+    }
+    
+    // assign the successful result to fi_ member
+    fi_ = info;
+    return NIXL_SUCCESS;
 }
 

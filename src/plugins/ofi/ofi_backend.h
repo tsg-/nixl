@@ -38,6 +38,7 @@
 #include <thread>
 #include <atomic>
 #include <condition_variable>
+#include <memory>
 
 class nixlOfiMetadata : public nixlBackendMD {
 public:
@@ -79,6 +80,30 @@ private:
     // disable copy
     nixlOfiRequest(const nixlOfiRequest&) = delete;
     nixlOfiRequest& operator=(const nixlOfiRequest&) = delete;
+};
+
+class nixlOfiHmemManager {
+public:
+    nixlOfiHmemManager();
+    ~nixlOfiHmemManager();
+    
+    bool determineHmemSupport() const;
+    void initializeHmemCapabilities();
+    fi_hmem_iface selectHmemInterface(const nixlBlobDesc &mem, uint64_t &device_id) const;
+    
+    nixl_status_t registerVramMemory(const nixlBlobDesc &mem, nixlOfiMetadata *ofi_meta, 
+                                     const struct fi_info* fi_info, fid_domain *domain) const;
+    nixl_status_t registerSynapseAIMemoryExplicit(const nixlBlobDesc &mem, nixlOfiMetadata *ofi_meta,
+                                                  const struct fi_info* fi_info, fid_domain *domain) const;
+    
+    bool isZeSupported() const { return hmemZeSupported_; }
+    bool isCudaSupported() const { return hmemCudaSupported_; }
+    bool isSynapseaiSupported() const { return hmemSynapseaiSupported_; }
+
+private:
+    bool hmemZeSupported_;
+    bool hmemCudaSupported_;
+    bool hmemSynapseaiSupported_;
 };
 
 class nixlOfiEngine : public nixlBackendEngine {
@@ -133,6 +158,7 @@ public:
     nixl_status_t getNotifs(notif_list_t &notif_list) override;
     nixl_status_t genNotif(const std::string &remote_agent, const std::string &msg) const override;
 
+
 private:
     // type definitions and nested classes
     struct ProviderConfig {
@@ -175,12 +201,13 @@ private:
     
     void configureHintsForProvider(struct fi_info* hints, const std::string& provider_name);
     
+    // OFI initialization helpers
+    nixl_status_t initializeOFI();
+    nixl_status_t createAndConfigureHints(bool need_hmem);
+    nixl_status_t performFiGetinfo();
+    
     // Memory registration helpers
-    static uint64_t getMemoryRegistrationAccessFlags(const struct fi_info* fi_info);
-    fi_hmem_iface selectHmemInterface(const nixlBlobDesc &mem, uint64_t &device_id) const;
     nixl_status_t registerDramMemory(const nixlBlobDesc &mem, nixlOfiMetadata *ofi_meta) const;
-    nixl_status_t registerVramMemory(const nixlBlobDesc &mem, nixlOfiMetadata *ofi_meta) const;
-    nixl_status_t registerHmemMemory(const nixlBlobDesc &mem, nixlOfiMetadata *ofi_meta, fi_hmem_iface iface, uint64_t device_id) const;
 
     // helper methods
     nixl_status_t handleCQError(fid_cq* cq, int error_ret) const;
@@ -204,6 +231,7 @@ private:
     fid_eq *eq_;
     fid_pep *pep_;
     struct fi_info *fi_;
+    struct fi_info *hints_;
     
     std::string providerName_;
     struct fi_info *cachedProviderInfo_;
@@ -226,27 +254,9 @@ private:
     std::mutex eqPauseMutex_;
     std::condition_variable eqPauseCV_;
     long eqTimeoutMs_;
-    bool hmemZeSupported_;
-    bool hmemCudaSupported_;
-    bool hmemSynapseaiSupported_;
-
     std::string localAgentName_;
-
-    // synapseAI dynamic loading handles
-    static void *synapseai_handle_;
-    static void *hlthunk_handle_;
     
-    struct synapseai_ops {
-        synStatus (*synInitialize)(void);
-        synStatus (*synDestroy)(void);
-        synStatus (*synDeviceAcquireByModuleId)(synDeviceId *pDeviceId, const synModuleId moduleId);
-        synStatus (*synDeviceGetInfoV2)(const synDeviceId deviceId, synDeviceInfoV2 *pDeviceInfo);
-        synStatus (*synStreamCreateGeneric)(synStreamHandle *pStreamHandle, const synDeviceId deviceId, const uint32_t flags);
-        int (*hlthunk_device_mapped_memory_export_dmabuf_fd)(int fd, uint64_t addr, uint64_t size, uint64_t offset, uint32_t flags);
-    };
-    static synapseai_ops synapseai_ops_;
-    
-    nixl_status_t registerSynapseAIMemoryExplicit(const nixlBlobDesc &mem, nixlOfiMetadata *ofi_meta) const;
+    std::unique_ptr<nixlOfiHmemManager> hmemManager_;
 
     // connection model helpers
     static inline bool decideConnectionlessFromInfo(const struct fi_info* info) {
