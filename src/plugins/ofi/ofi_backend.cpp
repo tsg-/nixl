@@ -21,14 +21,11 @@
 #include <rdma/fi_rma.h>
 #include <rdma/fi_endpoint.h>
 #include <stdexcept>
-#include <sstream>
 #include <unistd.h>
 #include <functional>
 #include <fcntl.h>
 
 #include <cstdlib>
-#include <chrono>
-#include <iomanip>
 
 // static synapseAI handles for dynamic loading
 void* nixlOfiEngine::synapseai_handle_ = nullptr;
@@ -48,38 +45,45 @@ nixlOfiEngine::nixlOfiEngine(const nixlBackendInitParams* init_params) :
     cachedProviderInfo_(nullptr),
     av_(nullptr),
     isConnectionless_(false),
-    localReady_(false),
     eqThreadStop_(false),
     eqThreadPaused_(false),
     eqTimeoutMs_(100),
     hmemZeSupported_(false),
     hmemCudaSupported_(false),
-    hmemSynapseaiSupported_(false),
-    localAgentName_(init_params->localAgent)
+    hmemSynapseaiSupported_(false)
 {
-    int ret = 0;
-    struct fi_info *info = nullptr;
+    localAgentName_ = init_params->localAgent;
     struct fi_info *hints = nullptr;
-    // localAgentName_ already initialized in member list
+    struct fi_info *info = nullptr;
+    int ret = 0;
 
     // use FI_PROVIDER environment variable or fall back to sensible defaults
     const char* env_provider = getenv("FI_PROVIDER");
     if (env_provider) {
         providerName_ = env_provider;
-        NIXL_DEBUG << "Using FI_PROVIDER environment variable: " << providerName_;
+        NIXL_INFO << "Using FI_PROVIDER=" << providerName_;
+        
+        // early guess for connection model (corrected after fi_getinfo)
+        isConnectionless_ = decideConnectionlessFromName(providerName_);
+        NIXL_DEBUG << "pre-fi_getinfo guess: connectionless=" << isConnectionless_;
     } else {
         // Default to verbs provider
         providerName_ = "verbs";
         NIXL_DEBUG << "Using default provider: " << providerName_;
+        isConnectionless_ = false; // conservative default
     }
 
-    // validate that the provider is supported
-    const auto* config = findProviderConfig(providerName_);
-    if (!config) {
-        NIXL_ERROR << "Unsupported provider: " << providerName_;
-        NIXL_ERROR << "Supported providers: shm, tcp, verbs";
-        this->initErr = true;
-        return;
+    // validate that the provider is supported (skip validation for minimal config providers)
+    bool useMinimalConfig = (providerName_ == "shm" || providerName_ == "tcp" || 
+                             providerName_ == "tcp;ofi_rxm" || providerName_ == "verbs;ofi_rxm");
+    if (!useMinimalConfig) {
+        const auto* config = findProviderConfig(providerName_);
+        if (!config) {
+            NIXL_ERROR << "Unsupported provider: " << providerName_;
+            NIXL_ERROR << "Supported providers: shm, tcp, tcp;ofi_rxm, verbs, verbs;ofi_rxm";
+            this->initErr = true;
+            return;
+        }
     }
 
     // get EQ timeout parameter (0-60 seconds max)
@@ -116,6 +120,8 @@ nixlOfiEngine::nixlOfiEngine(const nixlBackendInitParams* init_params) :
         }
     }
 
+    NIXL_INFO << "HMEM support requested: " << (need_hmem ? "YES" : "NO");
+
     if (need_hmem) {
         hints->caps |= FI_HMEM;
         NIXL_DEBUG << "Adding FI_HMEM to hints->caps for device memory support";
@@ -123,8 +129,9 @@ nixlOfiEngine::nixlOfiEngine(const nixlBackendInitParams* init_params) :
         NIXL_DEBUG << "HMEM not enabled - DRAM memory only";
     }
 
-    // for shm and tcp providers, use minimal configuration (only provider name)
-    if (providerName_ == "shm" || providerName_ == "tcp") {
+    // for shm, tcp, and rxm providers, use minimal configuration (only provider name)
+    if (providerName_ == "shm" || providerName_ == "tcp" || 
+        providerName_ == "tcp;ofi_rxm" || providerName_ == "verbs;ofi_rxm") {
         hints->fabric_attr->prov_name = strdup(providerName_.c_str());
         NIXL_DEBUG << "Using minimal auto-negotiated hints for " << providerName_ << " provider";
     } else {
@@ -145,10 +152,7 @@ nixlOfiEngine::nixlOfiEngine(const nixlBackendInitParams* init_params) :
 
     // let libfabric choose optimal settings; only override if explicitly needed
 
-    // let libfabric choose optimal network interface for distributed communication
-    const char* node = NULL;         // auto-discover available network interfaces
-    const char* service = "0";       // let system assign port
-    ret = fi_getinfo(FI_VERSION(1, 20), node, service, 0, hints, &info);
+    ret = fi_getinfo(FI_VERSION(1, 20), nullptr, nullptr, 0, hints, &info);
     if (ret) {
         NIXL_ERROR << "fi_getinfo failed: " << fi_strerror(-ret);
         NIXL_DEBUG << "Trying fi_getinfo with minimal hints for provider " << providerName_;
@@ -158,7 +162,7 @@ nixlOfiEngine::nixlOfiEngine(const nixlBackendInitParams* init_params) :
         if (minimal_hints) {
             minimal_hints->fabric_attr->prov_name = strdup(providerName_.c_str());
             struct fi_info *minimal_fi = nullptr;
-            int minimal_ret = fi_getinfo(FI_VERSION(1, 20), nullptr, nullptr, 0, minimal_hints, &minimal_fi);
+            int minimal_ret = fi_getinfo(FI_VERSION(1, 18), nullptr, nullptr, 0, minimal_hints, &minimal_fi);
             if (minimal_ret == 0) {
                 NIXL_DEBUG << "Provider " << providerName_ << " supports: caps=0x" << std::hex << minimal_fi->caps 
                          << " ep_type=" << minimal_fi->ep_attr->type;
@@ -181,35 +185,46 @@ nixlOfiEngine::nixlOfiEngine(const nixlBackendInitParams* init_params) :
     NIXL_DEBUG << "fi_ assigned successfully, checking provider info...";
     NIXL_DEBUG << "Selected provider: " << (fi_->fabric_attr->prov_name ? fi_->fabric_attr->prov_name : "unknown")
                << " with endpoint type: " << fi_tostr(&fi_->ep_attr->type, FI_TYPE_EP_TYPE);
+    NIXL_INFO << "Provider capabilities: " << fi_tostr(&fi_->caps, FI_TYPE_CAPS);
+    NIXL_INFO << "Provider mode: " << fi_tostr(&fi_->mode, FI_TYPE_MODE);
 
-    // connectionless provider?
-    isConnectionless_ = isConnectionlessProvider();
-    NIXL_DEBUG << "Provider " << providerName_ << " ep_type=" 
-               << fi_tostr(&fi_->ep_attr->type, FI_TYPE_EP_TYPE) 
-               << " isConnectionless=" << isConnectionless_;
+    // final decision after fi_getinfo(): correct for rxm and endpoint type
+    {
+        const char* selected_prov = fi_->fabric_attr ? fi_->fabric_attr->prov_name : "<unknown>";
+        bool finalConnless = decideConnectionlessFromInfo(fi_);
+        if (finalConnless != isConnectionless_) {
+            NIXL_DEBUG << "Connection model corrected after fi_getinfo(): provider="
+                       << selected_prov << " ep_type=" << (fi_->ep_attr ? fi_->ep_attr->type : -1)
+                       << " was=" << (isConnectionless_ ? "connectionless" : "connected")
+                       << " now=" << (finalConnless ? "connectionless" : "connected");
+            isConnectionless_ = finalConnless;
+        }
+        
+        NIXL_DEBUG << "Provider " << selected_prov << " ep_type=" 
+                   << fi_tostr(&fi_->ep_attr->type, FI_TYPE_EP_TYPE) 
+                   << " isConnectionless=" << isConnectionless_;
+    }
 
     // detect HMEM capabilities for this provider
     detectHmemCapabilities(fi_, providerName_, hmemCudaSupported_,
                            hmemZeSupported_, hmemSynapseaiSupported_);
 
-    // initialize our fabric
     ret = fi_fabric(fi_->fabric_attr, &fabric_, nullptr);
     if (ret) {
         NIXL_ERROR << "fi_fabric failed: " << fi_strerror(-ret);
         goto cleanup_teardown;
     }
 
-    // initialize our domain (associated with our fabric). A domain defines the 
-    /// boundary for associating different resources together
     ret = fi_domain(fabric_, fi_, &domain_, nullptr);
     if (ret) {
         NIXL_ERROR << "fi_domain failed: " << fi_strerror(-ret);
         goto cleanup_teardown;
     }
 
-    // initialize our endpoint (type of endpoint will be requested in hints)
     {
-        nixl_status_t setup_status = setupEndpoint(!isConnectionless_);
+        // RDM endpoints (including RXM) don't use passive endpoints, only MSG endpoints do
+        bool needPassiveEndpoint = (fi_->ep_attr->type == FI_EP_MSG);
+        nixl_status_t setup_status = setupEndpoint(needPassiveEndpoint);
         if (setup_status != NIXL_SUCCESS) {
             NIXL_ERROR << "setupEndpoint failed with status: " << setup_status;
             goto cleanup_teardown;
@@ -222,7 +237,19 @@ nixlOfiEngine::nixlOfiEngine(const nixlBackendInitParams* init_params) :
             NIXL_ERROR << "getEndpointAddress() failed with status: " << addr_status;
             goto cleanup_teardown;
         }
+        // Debug: print local address blob size and hex dump to help diagnose provider address format
         NIXL_DEBUG << "getEndpointAddress completed successfully, isConnectionless_=" << isConnectionless_;
+        {
+            std::string dump;
+            dump.reserve(localAddr_.size() * 3);
+            for (unsigned char c : localAddr_) {
+                char buf[4];
+                snprintf(buf, sizeof(buf), "%02x", c);
+                dump.append(buf);
+                dump.push_back(' ');
+            }
+            NIXL_DEBUG << "Local endpoint address len=" << localAddr_.size() << " hex=" << dump;
+        }
     }
 
     // cache provider use in connect()
@@ -503,54 +530,35 @@ nixl_status_t nixlOfiEngine::connect_unlocked(const std::string &remote_agent) {
             return NIXL_SUCCESS;
         }
 
-        // remote addr iterator/search
-        // remote_addr_it ->first is the key (name), ->second is the value (address)
         auto remote_addr_it = remoteAddrs_.find(remote_agent);
         if (remote_addr_it == remoteAddrs_.end()) {
             NIXL_ERROR << "Remote address for " << remote_agent << " not found.";
             return NIXL_ERR_NOT_FOUND;
         }
 
-        // conceptually, an address vector converts an endpoint address into an
-        // fi_addr_t.  fi_addr_t is a 64-bit value that is used in all `fast-path'
-        // operations data transfers and completions.
-        fi_addr_t addr;
-        const char* addr_data = remote_addr_it->second.data();
-        std::ostringstream hex_str;
-        for (size_t i = 0; i < remote_addr_it->second.size(); ++i) {
-            hex_str << " 0x" << std::hex << std::setfill('0') << std::setw(2) << (unsigned int)(unsigned char)addr_data[i];
-        }
-        NIXL_DEBUG << "Inserting address into AV: remote_agent=" << remote_agent 
-                   << " len=" << remote_addr_it->second.size() << " addr_hex=" << hex_str.str();
-        
-        int ret = fi_av_insert(av_, remote_addr_it->second.data(), 1, &addr, 0, nullptr);
-        NIXL_DEBUG << "fi_av_insert returned: " << ret << " (expected 1)";
-        if (ret != 1) {
-            NIXL_ERROR << "fi_av_insert failed: returned=" << ret << " error=" << fi_strerror(-ret);
-            if (ret >= 0) {
-                NIXL_ERROR << "Address format may be incompatible with provider " << providerName_;
+        fi_addr_t addr = FI_ADDR_UNSPEC;
+        // Debug: dump remote address blob before calling fi_av_insert
+        {
+            const std::string &r = remote_addr_it->second;
+            std::string dump;
+            dump.reserve(r.size() * 3);
+            for (unsigned char c : r) {
+                char buf[4];
+                snprintf(buf, sizeof(buf), "%02x", c);
+                dump.append(buf);
+                dump.push_back(' ');
             }
+            NIXL_DEBUG << "Attempting fi_av_insert for remote_agent=" << remote_agent
+                       << " addr_len=" << r.size() << " hex=" << dump;
+        }
+        int ret = fi_av_insert(av_, remote_addr_it->second.data(), 1, &addr, 0, nullptr);
+        if (ret != 1) {
+            NIXL_ERROR << "fi_av_insert failed: " << fi_strerror(-ret);
             return NIXL_ERR_BACKEND;
         }
 
-        // Validate fi_addr_t value
-        if (addr == FI_ADDR_UNSPEC) {
-            NIXL_ERROR << "fi_av_insert returned FI_ADDR_UNSPEC - invalid address!";
-            return NIXL_ERR_BACKEND;
-        }
-        
-        // Check for duplicate fi_addr_t values across different agents
-        for (const auto& existing : avAddrs_) {
-            if (existing.second == addr && existing.first != remote_agent) {
-                NIXL_WARN << "Duplicate fi_addr detected! Agent " << remote_agent 
-                         << " and " << existing.first << " both have fi_addr=0x" << std::hex << addr;
-            }
-        }
-        
         avAddrs_[remote_agent] = addr;
-        NIXL_DEBUG << "OFI backend: Added address mapping for " << remote_agent 
-                   << " fi_addr=0x" << std::hex << addr << std::dec << " (FI_ADDR_UNSPEC=" << std::hex << FI_ADDR_UNSPEC << std::dec << ")"
-                   << " - fi_addr validation: " << (addr == FI_ADDR_UNSPEC ? "INVALID" : "VALID");
+        NIXL_DEBUG << "fi_av_insert success: fi_addr=" << addr << " (ret=" << ret << ")";
         return NIXL_SUCCESS;
     }
 
@@ -670,8 +678,7 @@ nixl_status_t nixlOfiEngine::connect_unlocked(const std::string &remote_agent) {
     connectedEps_[remote_agent] = remote_ep;
     fi_freeinfo(remote_fi);
 
-    NIXL_DEBUG << "OFI backend: Connected to " << remote_agent << " with endpoint " << remote_ep;
-    NIXL_DEBUG << "Total connected endpoints: " << connectedEps_.size();
+    NIXL_DEBUG << "OFI backend: Connected to " << remote_agent;
     return NIXL_SUCCESS;
 }
 
@@ -725,43 +732,16 @@ nixl_status_t nixlOfiEngine::registerMem(const nixlBlobDesc &mem,
         return NIXL_ERR_BACKEND;
     }
 
-    if (!domain_) {
-        NIXL_ERROR << "Domain not initialized";
-        delete ofi_meta;
-        return NIXL_ERR_BACKEND;
-    }
+    nixl_status_t status = NIXL_SUCCESS;
     
-    if (mem.addr == 0 || mem.len == 0) {
-        NIXL_ERROR << "Invalid memory parameters: addr=" << mem.addr << " len=" << mem.len;
-        delete ofi_meta;
-        return NIXL_ERR_INVALID_PARAM;
-    }
-
-    if (nixl_mem != DRAM_SEG && nixl_mem != VRAM_SEG) {
+    if (nixl_mem == DRAM_SEG) {
+        status = registerDramMemory(mem, ofi_meta);
+    } else if (nixl_mem == VRAM_SEG) {
+        status = registerVramMemory(mem, ofi_meta);
+    } else {
         NIXL_ERROR << "Unsupported memory type: " << nixl_mem;
         delete ofi_meta;
         return NIXL_ERR_NOT_SUPPORTED;
-    }
-
-    nixl_status_t status = NIXL_SUCCESS;
-    
-    // DRAM_SEG = system memory, VRAM_SEG = device memory  
-    if (nixl_mem == DRAM_SEG) {
-        status = registerDramMemory(mem, ofi_meta);
-    } else {  // VRAM_SEG
-        // determine device interface for VRAM
-        uint64_t device_id = 0;
-        fi_hmem_iface iface = selectHmemInterface(mem, device_id);
-        
-        if (iface == FI_HMEM_SYNAPSEAI) {
-            status = registerSynapseAIMemoryExplicit(mem, ofi_meta);
-        } else if (iface != FI_HMEM_SYSTEM) {
-            status = registerHmemMemory(mem, ofi_meta, iface, device_id);
-        } else {
-            // VRAM requested but no device interface available - fallback
-            NIXL_WARN << "VRAM requested but no HMEM interface available - falling back to system memory";
-            status = registerDramMemory(mem, ofi_meta);
-        }
     }
 
     if (status != NIXL_SUCCESS) {
@@ -816,34 +796,54 @@ nixl_status_t nixlOfiEngine::prepXfer(const nixl_xfer_op_t &operation,
                                   const std::string &remote_agent,
                                   nixlBackendReqH* &handle,
                                   const nixl_opt_b_args_t* opt_args) const {
-    // validate parameters and setup handle
-    if (!ep_) {
-        NIXL_ERROR << "Primary endpoint not initialized";
-        return NIXL_ERR_BACKEND;
-    }
-    
-    if (!cq_) {
-        NIXL_ERROR << "Completion queue not initialized";
-        return NIXL_ERR_BACKEND;
-    }
-    
+    // validate parameters upfront
     if (local.descCount() != remote.descCount()) {
-        NIXL_ERROR << "Mismatched descriptor counts: local=" << local.descCount()
+        NIXL_ERROR << "mismatched descriptor counts: local=" << local.descCount()
                    << ", remote=" << remote.descCount();
         return NIXL_ERR_INVALID_PARAM;
     }
     
     if (local.descCount() <= 0) {
-        NIXL_ERROR << "No descriptors to transfer";
+        NIXL_ERROR << "no descriptors to transfer";
         return NIXL_ERR_INVALID_PARAM;
     }
     
+    // for connectionless providers, address resolution happens in postXfer
+    // for connection-oriented providers, connection validation happens in postXfer
+    
+    // validate all transfer parameters
+    for (size_t i = 0; i < static_cast<size_t>(local.descCount()); ++i) {
+        nixl_status_t status = validateTransferParams(local[i], remote[i]);
+        if (status != NIXL_SUCCESS) {
+            NIXL_ERROR << "validation failed for descriptor " << i;
+            return status;
+        }
+    }
+    
+    // create request handle
     nixlOfiRequest *ofi_req = new nixlOfiRequest();
     if (!ofi_req) {
         return NIXL_ERR_BACKEND;
     }
+    
+    // store parameters for later execution
     ofi_req->cq = cq_;
-    ofi_req->wr_id = local.descCount();
+    NIXL_DEBUG << "prepXfer: created request with cq=" << ofi_req->cq << " (engine cq=" << cq_ << ")";
+    ofi_req->operation = operation;
+    ofi_req->remote_agent = remote_agent;
+    ofi_req->total_operations = static_cast<size_t>(local.descCount());
+    ofi_req->completed_operations = 0;
+    ofi_req->is_prepared = true;
+    ofi_req->is_posted = false;
+    
+    // copy descriptors
+    ofi_req->local_descs.reserve(ofi_req->total_operations);
+    ofi_req->remote_descs.reserve(ofi_req->total_operations);
+    
+    for (size_t i = 0; i < ofi_req->total_operations; ++i) {
+        ofi_req->local_descs.push_back(local[i]);
+        ofi_req->remote_descs.push_back(remote[i]);
+    }
     
     handle = ofi_req;
     return NIXL_SUCCESS;
@@ -855,98 +855,273 @@ nixl_status_t nixlOfiEngine::postXfer(const nixl_xfer_op_t &operation,
                                   const std::string &remote_agent,
                                   nixlBackendReqH* &handle,
                                   const nixl_opt_b_args_t* opt_args) const {
-    nixlOfiRequest *ofi_req = static_cast<nixlOfiRequest*>(handle);
-    if (!ofi_req) {
-        NIXL_ERROR << "Invalid handle - prepXfer() must be called first";
+    
+    // handle prepared requests
+    if (handle) {
+        nixlOfiRequest *ofi_req = static_cast<nixlOfiRequest*>(handle);
+        if (!ofi_req->is_prepared) {
+            NIXL_ERROR << "request not prepared";
+            return NIXL_ERR_INVALID_PARAM;
+        }
+        if (ofi_req->is_posted) {
+            NIXL_ERROR << "request already posted";
+            return NIXL_ERR_INVALID_PARAM;
+        }
+        return postPreparedXfer(ofi_req);
+    }
+    
+    // legacy path: prepare and post immediately
+    nixl_status_t prep_status = prepXfer(operation, local, remote, remote_agent, handle, opt_args);
+    if (prep_status != NIXL_SUCCESS) {
+        return prep_status;
+    }
+    
+    return postPreparedXfer(static_cast<nixlOfiRequest*>(handle));
+}
+nixl_status_t nixlOfiEngine::postPreparedXfer(nixlOfiRequest* ofi_req) const {
+    if (!ep_) {
+        NIXL_ERROR << "primary endpoint not initialized";
+        return NIXL_ERR_BACKEND;
+    }
+    
+    if (!ofi_req || !ofi_req->is_prepared) {
+        NIXL_ERROR << "invalid or unprepared request";
         return NIXL_ERR_INVALID_PARAM;
     }
     
-    // get destination address/endpoint
+    // get target endpoint and destination address
     fid_ep *target_ep = ep_;
     fi_addr_t dest_addr = FI_ADDR_UNSPEC;
     
+    std::lock_guard<std::mutex> lock(epLock_);  // protect address/connection maps
+    
     if (isConnectionless_) {
-        auto it = avAddrs_.find(remote_agent);
-        if (it == avAddrs_.end()) {
-            NIXL_ERROR << "No address mapping for " << remote_agent;
+        // for connectionless (RDM/DGRAM), use address vector
+        auto av_it = avAddrs_.find(ofi_req->remote_agent);
+        if (av_it == avAddrs_.end()) {
+            NIXL_ERROR << "no AV address mapping for " << ofi_req->remote_agent << " (connectionless)";
+            NIXL_ERROR << "available mappings: " << avAddrs_.size();
+            for (const auto& pair : avAddrs_) {
+                NIXL_ERROR << "  " << pair.first;
+            }
             return NIXL_ERR_NOT_FOUND;
         }
-        dest_addr = it->second;
+        dest_addr = av_it->second;
+        NIXL_DEBUG << "using AV address " << dest_addr << " for " << ofi_req->remote_agent;
     } else {
-        auto it = connectedEps_.find(remote_agent);
+        // for connection-oriented (MSG), use connected endpoint
+        auto it = connectedEps_.find(ofi_req->remote_agent);
         if (it == connectedEps_.end()) {
-            NIXL_ERROR << "Not connected to " << remote_agent;
+            NIXL_ERROR << "not connected to " << ofi_req->remote_agent << " (connection-oriented)";
             return NIXL_ERR_NOT_FOUND;
         }
         target_ep = it->second;
+        if (!target_ep) {
+            NIXL_ERROR << "connected endpoint is null for " << ofi_req->remote_agent;
+            return NIXL_ERR_BACKEND;
+        }
+        NIXL_DEBUG << "using connected endpoint for " << ofi_req->remote_agent;
     }
+
+    // prepare contexts for operations
+    ofi_req->op_contexts.reserve(ofi_req->total_operations);
     
     // post all operations
-    for (size_t i = 0; i < static_cast<size_t>(local.descCount()); ++i) {
-        const nixlMetaDesc &local_desc = local[i];
-        const nixlMetaDesc &remote_desc = remote[i];
-        
+    int ret = 0;
+    for (size_t i = 0; i < ofi_req->total_operations; ++i) {
+        const nixlMetaDesc &local_desc = ofi_req->local_descs[i];
+        const nixlMetaDesc &remote_desc = ofi_req->remote_descs[i];
+
         nixlOfiMetadata *local_meta = static_cast<nixlOfiMetadata*>(local_desc.metadataP);
         nixlOfiMetadata *remote_meta = static_cast<nixlOfiMetadata*>(remote_desc.metadataP);
         
+        // parameters already validated in prepXfer
+
+        // get remote memory key
         uint64_t remote_key = getRemoteKey(remote_meta);
-        uint64_t* ctx = new uint64_t(i);
-        ofi_req->active_contexts.push_back(ctx);
+        NIXL_DEBUG << "Remote key extraction: mr=" << remote_meta->mr << " key=" << remote_key;
+        if (remote_meta->mr) {
+            NIXL_DEBUG << "  using fi_mr_key, calculated key=" << fi_mr_key(remote_meta->mr);
+        } else {
+            NIXL_DEBUG << "  using desc field, desc=" << remote_meta->desc;
+        }
         
-        int ret = (operation == NIXL_READ) ?
-            fi_read(target_ep, reinterpret_cast<void*>(local_desc.addr), local_desc.len,
-                   local_meta->desc, dest_addr, remote_desc.addr, remote_key, ctx) :
-            fi_write(target_ep, reinterpret_cast<void*>(local_desc.addr), local_desc.len,
-                    local_meta->desc, dest_addr, remote_desc.addr, remote_key, ctx);
+        struct fi_rma_iov rma_iov = {
+            .addr = (uint64_t)remote_desc.addr,
+            .len = remote_desc.len,
+            .key = remote_key
+        };
+
+        // create unique context for operation
+        auto op_context = std::make_unique<uint64_t>(i);
+        uint64_t* raw_context = op_context.get();
+        NIXL_DEBUG << "postXfer: operation " << i << " context=" << raw_context << " value=" << *raw_context;
         
+        NIXL_DEBUG << "RMA operation parameters:";
+        NIXL_DEBUG << "  local_addr=0x" << std::hex << local_desc.addr << " len=" << std::dec << local_desc.len;
+        NIXL_DEBUG << "  remote_addr=0x" << std::hex << rma_iov.addr << " key=" << rma_iov.key;
+        NIXL_DEBUG << "  dest_addr=" << dest_addr << " context=" << raw_context;
+        NIXL_DEBUG << "  local_desc=" << local_meta->desc;
+        
+        switch (ofi_req->operation) {
+            case NIXL_READ:
+                ret = fi_read(target_ep, reinterpret_cast<void*>(local_desc.addr),
+                             local_desc.len, local_meta->desc, dest_addr,
+                             rma_iov.addr, rma_iov.key, raw_context);
+                NIXL_DEBUG << "fi_read returned: " << ret << " (" << fi_strerror(-ret) << ")";
+                break;
+            case NIXL_WRITE:
+                ret = fi_write(target_ep, reinterpret_cast<void*>(local_desc.addr),
+                              local_desc.len, local_meta->desc, dest_addr,
+                              rma_iov.addr, rma_iov.key, raw_context);
+                break;
+            default:
+                NIXL_ERROR << "unsupported operation type";
+                return NIXL_ERR_NOT_SUPPORTED;
+        }
+
         if (ret && ret != -FI_EAGAIN) {
-            NIXL_ERROR << "Operation " << i << " failed: " << fi_strerror(-ret);
-            ofi_req->wr_id = i; // track successful operations
+            NIXL_ERROR << "operation " << i << " failed: " << fi_strerror(-ret);
+            NIXL_ERROR << "successfully posted " << ofi_req->op_contexts.size() << " operations before failure";
+            // update total operations to match what was actually posted
+            ofi_req->total_operations = ofi_req->op_contexts.size();
+            if (ofi_req->total_operations > 0) {
+                ofi_req->is_posted = true;  // mark as posted for cleanup
+                NIXL_ERROR << "partial posting: " << ofi_req->total_operations << " operations posted";
+            }
             return NIXL_ERR_BACKEND;
         }
+        
+        // operation posted successfully (ret == 0 or ret == -FI_EAGAIN)
+        ofi_req->op_contexts.push_back(std::move(op_context));
+        
+        if (ret == -FI_EAGAIN) {
+            NIXL_DEBUG << "operation " << i << " posted asynchronously";
+        }
     }
-    
-    return NIXL_IN_PROG;
+
+    // mark as posted
+    ofi_req->is_posted = true;
+    return NIXL_SUCCESS;
 }
 
 nixl_status_t nixlOfiEngine::checkXfer(nixlBackendReqH* handle) const {
     nixlOfiRequest *ofi_req = static_cast<nixlOfiRequest*>(handle);
     if (!ofi_req || !ofi_req->cq) {
+        NIXL_ERROR << "checkXfer: invalid request or CQ";
         return NIXL_ERR_INVALID_PARAM;
     }
 
-    uint64_t expected_completions = ofi_req->wr_id.load();
-    if (expected_completions == 0) {
+    if (!ofi_req->is_posted) {
+        NIXL_ERROR << "checkXfer: request not posted yet";
+        return NIXL_ERR_INVALID_PARAM; // request not posted yet
+    }
+
+    NIXL_DEBUG << "checkXfer: completed=" << ofi_req->completed_operations 
+              << " total=" << ofi_req->total_operations;
+
+    if (ofi_req->isComplete()) {
+        NIXL_DEBUG << "checkXfer: all operations completed";
         return NIXL_SUCCESS;
     }
+
+    // read available completions
+    const size_t batch_size = 16;
+    // struct fi_cq_data_entry entries[batch_size];
+    struct fi_cq_entry entries[batch_size];
+    int ret = fi_cq_read(ofi_req->cq, entries, batch_size);
     
-    // drain available completions
-    struct fi_cq_data_entry entries[64];
-    int ret = fi_cq_read(ofi_req->cq, entries, 64);
+    NIXL_DEBUG << "checkXfer: fi_cq_read returned " << ret;
     
     if (ret > 0) {
-        // clean up contexts
+        // update completion count
+        ofi_req->completed_operations += static_cast<size_t>(ret);
+        NIXL_DEBUG << "checkXfer: got " << ret << " completions, total completed=" 
+                  << ofi_req->completed_operations << "/" << ofi_req->total_operations;
+        
+        // log completion contexts for debugging
         for (int i = 0; i < ret; ++i) {
-            if (entries[i].op_context) {
-                delete static_cast<uint64_t*>(entries[i].op_context);
-            }
+            NIXL_DEBUG << "checkXfer: completion " << i << " context=" << entries[i].op_context;
         }
         
-        // update remaining completions
-        uint64_t expected = ofi_req->wr_id.load();
-        uint64_t new_count;
-        do {
-            new_count = (expected >= static_cast<uint64_t>(ret)) ? expected - ret : 0;
-        } while (!ofi_req->wr_id.compare_exchange_weak(expected, new_count));
-        
-        return (new_count == 0) ? NIXL_SUCCESS : NIXL_IN_PROG;
-    } else if (ret == -FI_EAGAIN) {
+        if (ofi_req->isComplete()) {
+            NIXL_DEBUG << "checkXfer: all operations completed - SUCCESS";
+            return NIXL_SUCCESS;
+        }
         return NIXL_IN_PROG;
-    } else {
-        NIXL_ERROR << "checkXfer: fi_cq_read error " << ret << " (" << fi_strerror(-ret) << ")";
+    } else if (ret == -FI_EAGAIN) {
+        NIXL_DEBUG << "checkXfer: no completions available (EAGAIN)";
+        return NIXL_IN_PROG;
+    } else if (ret < 0) {
+        NIXL_ERROR << "checkXfer: CQ error, calling handleCQError";
         return handleCQError(ofi_req->cq, ret);
     }
+    
+    return NIXL_IN_PROG;
 }
+
+#if 0
+nixl_status_t nixlOfiEngine::checkXfer(nixlBackendReqH* handle) const {
+    auto* ofi_req = static_cast<ofi_req_t*>(handle);  // your context type
+    if (!ofi_req) return NIXL_ERR_INVAL;
+
+    // drain up to N completions per call
+    constexpr size_t batch = 32;
+    struct fi_cq_entry entries[batch];
+
+    for (;;) {
+        ssize_t rc = fi_cq_read(cq_, entries, batch);
+
+        if (rc > 0) {
+            for (ssize_t i = 0; i < rc; ++i) {
+                void* ctx = entries[i].op_context;
+                auto* done_req = static_cast<ofi_req_t*>(ctx);
+                if (!done_req) {
+                    NIXL_ERROR << "CQ returned null op_context";
+                    return NIXL_ERR_BACKEND;
+                }
+                // decrement pending and mark completion
+                auto left = done_req->pending.fetch_sub(1, std::memory_order_acq_rel) - 1;
+                if (left == 0) {
+                    done_req->complete.store(true, std::memory_order_release);
+                }
+            }
+            // keep draining until CQ is empty this call
+            continue;
+        }
+
+        if (rc == -FI_EAGAIN) {
+            // no more completions now
+            break;
+        }
+
+        // rc < 0 and not EAGAIN: pull error entry for details
+        struct fi_cq_err_entry err = {};
+        int erc = fi_cq_readerr(cq_, &err, 0);
+        if (erc > 0) {
+            const char* emsg = fi_strerror(err.err);
+            NIXL_ERROR << "CQ error: " << emsg
+                       << " prov_err=" << err.prov_errno
+                       << " ctx=" << err.op_context;
+            // best effort: decrement the request we find in err.op_context
+            if (err.op_context) {
+                auto* bad_req = static_cast<ofi_req_t*>(err.op_context);
+                auto left = bad_req->pending.fetch_sub(1, std::memory_order_acq_rel) - 1;
+                bad_req->failed.store(true, std::memory_order_release);
+                if (left == 0) bad_req->complete.store(true, std::memory_order_release);
+            }
+            return NIXL_ERR_BACKEND;
+        } else {
+            NIXL_ERROR << "fi_cq_read failed: " << fi_strerror(-rc);
+            return NIXL_ERR_BACKEND;
+        }
+    }
+
+    // report status of the specific handle we were asked to check
+    if (ofi_req->failed.load(std::memory_order_acquire)) return NIXL_ERR_BACKEND;
+    return ofi_req->complete.load(std::memory_order_acquire) ? NIXL_OK : NIXL_IN_PROG;
+}
+#endif
 
 nixl_status_t nixlOfiEngine::releaseReqH(nixlBackendReqH* handle) const {
     nixlOfiRequest *ofi_req = static_cast<nixlOfiRequest*>(handle);
@@ -954,43 +1129,36 @@ nixl_status_t nixlOfiEngine::releaseReqH(nixlBackendReqH* handle) const {
         return NIXL_ERR_INVALID_PARAM;
     }
     
-    // try to drain a few pending completions to prevent context leaks
-    if (ofi_req->wr_id.load() > 0) {
+    // try to drain pending completions briefly
+    if (ofi_req->is_posted && !ofi_req->isComplete()) {
         int drain_attempts = 0;
-        const int max_drain_attempts = 10; // reduced from 1000 to be less aggressive
+        const int max_drain_attempts = 5;
         
-        while (ofi_req->wr_id.load() > 0 && drain_attempts < max_drain_attempts) {
+        while (!ofi_req->isComplete() && drain_attempts < max_drain_attempts) {
             nixl_status_t status = checkXfer(handle);
             if (status == NIXL_ERR_BACKEND) {
-                break; // stop on CQ error
+                break;
             }
             drain_attempts++;
             
-            if (ofi_req->wr_id.load() > 0) {
-                usleep(100); // 100 microseconds - slightly longer delay
+            if (!ofi_req->isComplete()) {
+                usleep(100);
             }
         }
         
-        // if still pending, just log and continue - better than hanging
-        uint64_t remaining = ofi_req->wr_id.load();
-        if (remaining > 0) {
-            NIXL_DEBUG << "Releasing request with " << remaining << " pending operations";
+        if (!ofi_req->isComplete()) {
+            NIXL_DEBUG << "releasing request with " << ofi_req->remainingOperations() 
+                      << " pending operations";
         }
     }
     
+    // contexts cleaned up automatically by unique_ptr destructors
     delete ofi_req;
     return NIXL_SUCCESS;
 }
 
 nixl_status_t nixlOfiEngine::getConnInfo(std::string &conn_info) const {
     conn_info = localAddr_;
-    std::ostringstream hex_str;
-    for (size_t i = 0; i < std::min(localAddr_.size(), size_t(32)); ++i) {
-        hex_str << " 0x" << std::hex << std::setfill('0') << std::setw(2) << (unsigned int)(unsigned char)localAddr_[i];
-    }
-    if (localAddr_.size() > 32) hex_str << "... (truncated)";
-    NIXL_DEBUG << "getConnInfo() returning local address: len=" << localAddr_.size() 
-               << " addr_hex=" << hex_str.str();
     return NIXL_SUCCESS;
 }
 
@@ -1006,66 +1174,19 @@ nixl_status_t nixlOfiEngine::loadRemoteConnInfo(const std::string &remote_agent,
         return NIXL_ERR_INVALID_PARAM;
     }
     
-    std::ostringstream hex_str;
-    for (size_t i = 0; i < std::min(conn_info.size(), size_t(32)); ++i) {
-        hex_str << " 0x" << std::hex << std::setfill('0') << std::setw(2) << (unsigned int)(unsigned char)conn_info[i];
-    }
-    if (conn_info.size() > 32) hex_str << "... (truncated)";
-    NIXL_DEBUG << "loadRemoteConnInfo() received remote address: agent=" << remote_agent
-               << " len=" << conn_info.size() << " addr_hex=" << hex_str.str();
-    
-    // Decode address for debugging  
-    if (conn_info.size() >= 10 && conn_info.substr(0, 6) == "fi_shm") {
-        NIXL_DEBUG << "Decoded remote address: '" << conn_info << "'";
-    }
-    
-    // DEBUG: Show which process is calling this
-    NIXL_DEBUG << "*** PROCESS " << getpid() << " IS LOADING REMOTE AGENT " << remote_agent << " ***";
-    
     std::lock_guard<std::mutex> lock(epLock_);
+    NIXL_DEBUG << "loadRemoteConnInfo: storing conn_info for " << remote_agent << " size=" << conn_info.size();
     remoteAddrs_[remote_agent] = conn_info;
     
-    // establish connection immediately when remote agent info is loaded
-    // for connectionless providers, "connect" doesn't establish a connection.
-    // it's really "address registration" or "AV population"
+    // CRITICAL FIX: Establish connection immediately when remote agent info is loaded
+    // This prevents data integrity issues caused by auto-connect during first transfer
     NIXL_DEBUG << "Establishing connection to " << remote_agent << " immediately";
     nixl_status_t connect_status = connect_unlocked(remote_agent);
     if (connect_status != NIXL_SUCCESS) {
         NIXL_ERROR << "Failed to establish connection to " << remote_agent << " during loadRemoteConnInfo";
+        // Remove the address entry since connection failed
         remoteAddrs_.erase(remote_agent);
         return connect_status;
-    }
-    
-    // RDM endpoint bidirectional readiness synchronization
-    if (isConnectionless_) {
-        NIXL_DEBUG << "Connectionless provider - implementing bidirectional readiness sync";
-        if (localAddr_ == conn_info) {
-            NIXL_ERROR << "CRITICAL: Both endpoints have identical addresses! " 
-                       << "This will cause RMA failures. Provider may not support multiple processes on same node.";
-        }
-        
-        // mark local endpoint as ready after successful address vector setup
-        markLocalReady();
-        
-        // asymmetric synchronization: avoid deadlock by using agent name ordering
-        NIXL_DEBUG << "Implementing asymmetric readiness sync for " << remote_agent;
-        
-        // use lexicographic ordering to avoid both processes waiting simultaneously
-        bool should_wait = (localAgentName_ < remote_agent);
-        int wait_ms = should_wait ? 150 : 50;  // staggered delays
-        
-        NIXL_DEBUG << "Process " << localAgentName_ << " waiting " << wait_ms << "ms for " << remote_agent;
-        std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
-        
-        // mark remote as ready after wait
-        markRemoteReady(remote_agent);
-        
-        if (areBothReady(remote_agent)) {
-            NIXL_DEBUG << "Both endpoints ready for RDM operations";
-        } else {
-            NIXL_ERROR << "Timeout waiting for bidirectional readiness";
-            return NIXL_ERR_BACKEND;
-        }
     }
     
     NIXL_DEBUG << "Successfully established connection to " << remote_agent;
@@ -1075,16 +1196,14 @@ nixl_status_t nixlOfiEngine::loadRemoteConnInfo(const std::string &remote_agent,
 nixl_status_t nixlOfiEngine::getPublicData(const nixlBackendMD* meta, std::string &str) const {
     const nixlOfiMetadata* ofi_meta = static_cast<const nixlOfiMetadata*>(meta);
     if (!ofi_meta || !ofi_meta->mr) {
+        NIXL_ERROR << "getPublicData: invalid metadata - ofi_meta=" << ofi_meta << " mr=" << (ofi_meta ? ofi_meta->mr : nullptr);
         return NIXL_ERR_INVALID_PARAM;
     }
     
     // serialize memory registration key for remote access
     uint64_t mr_key = fi_mr_key(ofi_meta->mr);
     str = std::to_string(mr_key);
-    
-    NIXL_DEBUG << "Serializing MR key: mr=" << ofi_meta->mr 
-               << " key=0x" << std::hex << mr_key << " str=" << str;
-    
+    NIXL_ERROR << "getPublicData: mr_key=" << mr_key << " str=" << str;
     return NIXL_SUCCESS;
 }
 
@@ -1109,10 +1228,8 @@ nixl_status_t nixlOfiEngine::loadRemoteMD(const nixlBlobDesc &input, const nixl_
         std::string key_str(input.metaInfo.begin(), input.metaInfo.end());
         uint64_t remote_key = std::stoull(key_str);
         
-        NIXL_DEBUG << "Loading remote MR key: key_str='" << key_str 
-                   << "' key=0x" << std::hex << remote_key;
-        
-        // validate remote key before storing (allow 0 for some providers)
+        // validate remote key before storing
+        // Note: key=0 is valid for some providers (e.g., TCP) that don't use memory keys
         if (remote_key == UINT64_MAX) {
             delete remote_meta;
             NIXL_ERROR << "Invalid remote memory key: " << remote_key;
@@ -1229,15 +1346,8 @@ void nixlOfiEngine::eq_event_loop() {
     }
 }
 
-bool nixlOfiEngine::isConnectionlessProvider() const {
-    // use libfabric's endpoint type to determine connection model
-    // FI_EP_RDM (Reliable Datagram) = connectionless
-    // FI_EP_MSG (Message) = connection-oriented  
-    // FI_EP_DGRAM (Datagram) = connectionless
-    return (fi_->ep_attr->type == FI_EP_RDM || fi_->ep_attr->type == FI_EP_DGRAM);
-}
 
-nixl_status_t nixlOfiEngine::setupEndpoint(bool connection_oriented) {
+nixl_status_t nixlOfiEngine::setupEndpoint(bool use_passive_endpoint) {
     int ret = 0;
 
     // create endpoint
@@ -1247,25 +1357,24 @@ nixl_status_t nixlOfiEngine::setupEndpoint(bool connection_oriented) {
         return NIXL_ERR_BACKEND; // ep_ was never created, no cleanup needed
     }
 
-    // create and bind completion queue  
+    // create and bind completion queue
     struct fi_cq_attr cq_attr = {};
-    cq_attr.size = 1024; // increase queue size for better throughput
-    cq_attr.format = FI_CQ_FORMAT_DATA; // use DATA format for better RMA support
+    cq_attr.size = 128; // use fi_->tx_attr->size + fi_->rx_attr->size?
+    cq_attr.format = FI_CQ_FORMAT_CONTEXT;
     ret = fi_cq_open(domain_, &cq_attr, &cq_, nullptr);
     if (ret) {
         NIXL_ERROR << "fi_cq_open failed: " << fi_strerror(-ret);
         goto cleanup_setup;
     }
 
-    // in or out on that endpoint. A CQ can be bound to multiple endpoints 
-    // but one EP can only have one send CQ and one receive CQ 
+    // bind cq to endpoint
     ret = fi_ep_bind(ep_, &cq_->fid, FI_SEND | FI_RECV);
     if (ret) {
         NIXL_ERROR << "fi_ep_bind to CQ failed: " << fi_strerror(-ret);
         goto cleanup_setup;
     }
 
-    if (connection_oriented) {
+    if (use_passive_endpoint) {
         // event queue for connection management
         struct fi_eq_attr eq_attr = {};
         eq_attr.size = 64;
@@ -1305,34 +1414,31 @@ nixl_status_t nixlOfiEngine::setupEndpoint(bool connection_oriented) {
             NIXL_ERROR << "fi_listen failed: " << fi_strerror(-ret);
             goto cleanup_setup;
         }
-        NIXL_DEBUG << "TCP passive endpoint listening for connections";
+        
+        // enable the endpoint for connection-oriented
+        ret = fi_enable(ep_);
+        if (ret) {
+            NIXL_ERROR << "fi_enable failed: " << fi_strerror(-ret);
+            goto cleanup_setup;
+        }
+        
+        NIXL_DEBUG << "connection-oriented endpoint listening for connections";
     } else {
-        // address vector for connectionless communication (RDM, DGRAM).
-        // AVs are used to map higher level addresses into fabric-specific
-        // addresses, starting with fi_addr 0.  These addresses are used in
-        // data transfers to specify which peer to send/recv from.
+        // address vector for connectionless communication
         struct fi_av_attr av_attr = {};
-
-        // with FI_AV_MAP, the fi_addr_t format is provider-specific and can
-        // encode the target's address directly. For example, with TCP/IPv4
-        // fabrics, the provider can embed the IP address and port directly
-        // in the fi_addr_t value.
-        av_attr.type = FI_AV_MAP;
+        av_attr.type = FI_AV_TABLE;
         ret = fi_av_open(domain_, &av_attr, &av_, nullptr);
         if (ret) {
             NIXL_ERROR << "fi_av_open failed: " << fi_strerror(-ret);
             goto cleanup_setup;
         }
 
-        // bind the AV to endpoint.  EP can only send data to a peer in its AV
-        // AV can be bound to multiple EPs but EP can have only one AV
         ret = fi_ep_bind(ep_, &av_->fid, 0);
         if (ret) {
             NIXL_ERROR << "fi_ep_bind to AV failed: " << fi_strerror(-ret);
             goto cleanup_setup;
         }
 
-        // all EP resources initialized .. enable EP
         ret = fi_enable(ep_);
         if (ret) {
             NIXL_ERROR << "fi_enable failed: " << fi_strerror(-ret);
@@ -1378,10 +1484,9 @@ void nixlOfiEngine::detectHmemCapabilities(struct fi_info* fi_info,
     if (!fi_info || !(fi_info->caps & FI_HMEM)) {
         NIXL_DEBUG << "Provider " << provider_name << " does not support generic HMEM";
         
-        // Special case: verbs can support SynapseAI through DMA buffers
-        // even without advertising FI_HMEM capability.
-        // Evidence: vrb_read_params() logs "dmabuf support is enabled" for verbs
-        if (provider_name == "verbs") {
+        // Special cases: providers that support SynapseAI through DMA buffers
+        // even without advertising FI_HMEM capability
+        if (provider_name == "verbs" || provider_name == "verbs;ofi_rxm") {
             synapseai_supported = true;
         } else {
             synapseai_supported = false;
@@ -1530,68 +1635,50 @@ fi_hmem_iface nixlOfiEngine::selectHmemInterface(const nixlBlobDesc &mem, uint64
 }
 
 nixl_status_t nixlOfiEngine::registerDramMemory(const nixlBlobDesc &mem, nixlOfiMetadata *ofi_meta) const {
-    uint64_t access_flags = getMemoryRegistrationAccessFlags(fi_);
-    
-    // use provider-specific key like fabtests - some providers need non-zero keys
-    uint64_t mr_key = 0;
-    if (providerName_ == "verbs" || fi_->fabric_attr->prov_name) {
-        // use memory address as base key to ensure uniqueness across processes
-        mr_key = mem.addr & 0xFFFFFFFF; // truncate to 32-bit for compatibility
+    if (!domain_) {
+        NIXL_ERROR << "Domain not initialized";
+        return NIXL_ERR_BACKEND;
     }
     
-    NIXL_DEBUG << "Registering DRAM memory: addr=0x" << std::hex << mem.addr 
-               << " len=" << std::dec << mem.len << " key=0x" << std::hex << mr_key;
+    if (mem.addr == 0 || mem.len == 0) {
+        NIXL_ERROR << "Invalid memory parameters: addr=" << mem.addr << " len=" << mem.len;
+        return NIXL_ERR_INVALID_PARAM;
+    }
+    
+    // Check if this is actually device memory (HPU) that should use HMEM
+    uint64_t device_id = 0;
+    fi_hmem_iface iface = selectHmemInterface(mem, device_id);
+    
+    if (iface != FI_HMEM_SYSTEM) {
+        if (iface == FI_HMEM_SYNAPSEAI) {
+            // Use explicit SynapseAI registration to avoid hcclLookupDMABuff segfault
+            NIXL_DEBUG << "DRAM_SEG memory detected as SynapseAI device memory, using explicit dmabuf registration";
+            return registerSynapseAIMemoryExplicit(mem, ofi_meta);
+        }
+        // This is actually device memory, use HMEM registration
+        NIXL_DEBUG << "DRAM_SEG memory detected as device memory, using HMEM registration";
+        return registerVramMemory(mem, ofi_meta);
+    }
+    
+    // Standard host DRAM registration
+    uint64_t access_flags = getMemoryRegistrationAccessFlags(fi_);
     
     int ret = fi_mr_reg(domain_, reinterpret_cast<void*>(mem.addr), mem.len,
-                       access_flags, 0, mr_key, 0, &ofi_meta->mr, nullptr);
+                       access_flags, 0, 0, 0, &ofi_meta->mr, nullptr);
     
     if (ret) {
-        NIXL_ERROR << "fi_mr_reg failed for system memory: " << fi_strerror(-ret);
+        NIXL_ERROR << "fi_mr_reg failed for DRAM: " << fi_strerror(-ret);
         ofi_meta->mr = nullptr;
         return NIXL_ERR_BACKEND;
     }
     
-    NIXL_DEBUG << "MR registered successfully: mr=" << ofi_meta->mr 
-               << " key=" << std::hex << fi_mr_key(ofi_meta->mr);
+    ofi_meta->desc = fi_mr_desc(ofi_meta->mr);
     
-    return NIXL_SUCCESS;
-}
-
-nixl_status_t nixlOfiEngine::registerHmemMemory(const nixlBlobDesc &mem, nixlOfiMetadata *ofi_meta, fi_hmem_iface iface, uint64_t device_id) const {
-    if (device_id >= UINT32_MAX) {
-        NIXL_ERROR << "Invalid device ID: " << device_id;
-        return NIXL_ERR_INVALID_PARAM;
-    }
-    
-    struct fi_mr_attr mr_attr = {};
-    struct iovec iov = {};
-    
-    iov.iov_base = reinterpret_cast<void*>(mem.addr);
-    iov.iov_len = mem.len;
-    
-    mr_attr.mr_iov = &iov;
-    mr_attr.iov_count = 1;
-    mr_attr.access = getMemoryRegistrationAccessFlags(fi_);
-    mr_attr.iface = iface;
-    
-    switch (iface) {
-        case FI_HMEM_CUDA:
-            mr_attr.device.cuda = static_cast<uint32_t>(device_id);
-            break;
-        case FI_HMEM_ZE:
-            mr_attr.device.ze = static_cast<uint32_t>(device_id);
-            break;
-        case FI_HMEM_SYNAPSEAI:
-            mr_attr.device.synapseai = static_cast<uint32_t>(device_id);
-            break;
-        default:
-            NIXL_ERROR << "Unsupported HMEM interface: " << iface;
-            return NIXL_ERR_NOT_SUPPORTED;
-    }
-    
-    int ret = fi_mr_regattr(domain_, &mr_attr, 0, &ofi_meta->mr);
-    if (ret) {
-        NIXL_ERROR << "fi_mr_regattr failed for HMEM: " << fi_strerror(-ret);
+    uint64_t mr_key = fi_mr_key(ofi_meta->mr);
+    NIXL_ERROR << "registerDramMemory: registered mr=" << ofi_meta->mr << " key=" << mr_key << " addr=0x" << std::hex << mem.addr << std::dec << " len=" << mem.len;
+    if (!ofi_meta->desc) {
+        NIXL_ERROR << "fi_mr_desc failed";
+        fi_close(&ofi_meta->mr->fid);
         ofi_meta->mr = nullptr;
         return NIXL_ERR_BACKEND;
     }
@@ -1672,7 +1759,7 @@ nixl_status_t nixlOfiEngine::registerSynapseAIMemoryExplicit(const nixlBlobDesc 
     
     // Align device offset to suit page size
     uint64_t device_offset = mem.addr - hbm_base;
-    uint64_t modi_mem_addr;
+    uint64_t modi_mem_addr = mem.addr;
     if (mem.addr % ACCEL_PAGE_SIZE) {
         modi_mem_addr = (mem.addr / ACCEL_PAGE_SIZE) * ACCEL_PAGE_SIZE;
         device_offset -= mem.addr - modi_mem_addr;
@@ -1686,7 +1773,7 @@ nixl_status_t nixlOfiEngine::registerSynapseAIMemoryExplicit(const nixlBlobDesc 
               << " tensor data ptr=0x" << std::hex << mem.addr
               << " modified tensor data ptr=0x" << std::hex << modi_mem_addr
               << " offset=0x" << std::hex << device_offset;
-
+    
     // Get dmabuf fd
     int dmabuf_fd = synapseai_ops_.hlthunk_device_mapped_memory_export_dmabuf_fd(
         device_info.fd,
@@ -1713,8 +1800,9 @@ nixl_status_t nixlOfiEngine::registerSynapseAIMemoryExplicit(const nixlBlobDesc 
     struct fi_mr_dmabuf dmabuf = {};
     dmabuf.fd = dmabuf_fd;
     dmabuf.offset = 0;                                   // kernel handled offset
-    dmabuf.len = modi_memlen;                                // exact buffer size
-    dmabuf.base_addr = reinterpret_cast<void*>(modi_mem_addr); // exact buffer start
+    dmabuf.len = modi_memlen;                                // page-aligned buffer size
+    dmabuf.base_addr = reinterpret_cast<void*>(modi_mem_addr); // page-aligned buffer start
+    dmabuf.offset = 0;                                   // kernel handled offset
     
     // Set up memory registration attributes
     struct fi_mr_attr mr_attr = {};
@@ -1751,33 +1839,169 @@ nixl_status_t nixlOfiEngine::registerSynapseAIMemoryExplicit(const nixlBlobDesc 
     return NIXL_SUCCESS;
 }
 
-// cleanup contexts in nixlOfiRequest
-void nixlOfiRequest::cleanup_contexts() {
-    std::lock_guard<std::mutex> lock(context_lock);
-    for (auto* ctx : active_contexts) {
-        delete ctx;
+nixl_status_t nixlOfiEngine::registerVramMemory(const nixlBlobDesc &mem, nixlOfiMetadata *ofi_meta) const {
+    if (!domain_) {
+        NIXL_ERROR << "Domain not initialized";
+        return NIXL_ERR_BACKEND;
     }
-    active_contexts.clear();
-}
+    
+    if (mem.addr == 0 || mem.len == 0) {
+        NIXL_ERROR << "Invalid memory parameters: addr=" << mem.addr << " len=" << mem.len;
+        return NIXL_ERR_INVALID_PARAM;
+    }
+    
+    struct fi_mr_attr mr_attr = {};
+    struct iovec iov = {};
+    
+    iov.iov_base = reinterpret_cast<void*>(mem.addr);
+    iov.iov_len = mem.len;
+    
+    mr_attr.mr_iov = &iov;
+    mr_attr.iov_count = 1;
+    mr_attr.access = getMemoryRegistrationAccessFlags(fi_);
+    
+    uint64_t device_id = 0;
+    mr_attr.iface = selectHmemInterface(mem, device_id);
+    
+    if (mr_attr.iface == FI_HMEM_SYSTEM) {
+        NIXL_WARN << "VRAM requested but HMEM interface unavailable - falling back to system memory registration";
+        return registerDramMemory(mem, ofi_meta);
+    }
 
-
-// handle completion queue errors
-nixl_status_t nixlOfiEngine::handleCQError(fid_cq* cq, int error_ret) const {
-    struct fi_cq_err_entry err_entry;
-    int err_ret = fi_cq_readerr(cq, &err_entry, 0);
-    if (err_ret > 0) {
-        NIXL_ERROR << "CQ error: " << fi_strerror(err_entry.err) << " (" << err_entry.err << ")";
-        // cleanup context on error
-        if (err_entry.op_context) {
-            delete static_cast<uint64_t*>(err_entry.op_context);
+    // Use explicit dmabuf registration for SynapseAI to avoid hcclLookupDMABuff segfault
+    if (mr_attr.iface == FI_HMEM_SYNAPSEAI) {
+        NIXL_DEBUG << "Using explicit SynapseAI dmabuf registration (fabtests approach)";
+        return registerSynapseAIMemoryExplicit(mem, ofi_meta);
+    }
+    
+    if (device_id >= UINT32_MAX) {
+        NIXL_ERROR << "Invalid device ID: " << device_id;
+        return NIXL_ERR_INVALID_PARAM;
+    }
+    
+    switch (mr_attr.iface) {
+        case FI_HMEM_CUDA:
+            mr_attr.device.cuda = static_cast<uint32_t>(device_id);
+            break;
+        case FI_HMEM_ZE:
+            mr_attr.device.ze = static_cast<uint32_t>(device_id);
+            break;
+        case FI_HMEM_SYNAPSEAI:
+            mr_attr.device.synapseai = static_cast<uint32_t>(device_id);
+            break;
+        default:
+            mr_attr.device.reserved = 0;
+            break;
+    }
+    
+    uint64_t reg_flags = 0;
+    if (fi_ && fi_->domain_attr && fi_->domain_attr->mr_mode) {
+        if (fi_->domain_attr->mr_mode & FI_MR_HMEM) {
+            reg_flags |= FI_HMEM_DEVICE_ONLY;
         }
-    } else {
-        NIXL_ERROR << "fi_cq_read failed: " << fi_strerror(-error_ret);
+        NIXL_DEBUG << "Provider MR mode: 0x" << std::hex << fi_->domain_attr->mr_mode 
+                  << " using reg_flags: 0x" << reg_flags;
     }
-    return NIXL_ERR_BACKEND;
+    
+    NIXL_DEBUG << "Registering VRAM memory with interface " << mr_attr.iface 
+              << " access 0x" << std::hex << mr_attr.access 
+              << " flags 0x" << reg_flags;
+              
+    int ret = fi_mr_regattr(domain_, &mr_attr, reg_flags, &ofi_meta->mr);
+    
+    if (ret) {
+        ofi_meta->mr = nullptr;
+        
+        if (mr_attr.iface == FI_HMEM_SYNAPSEAI) {
+            NIXL_ERROR << "SynapseAI device memory registration failed: " << fi_strerror(-ret);
+            
+            // provide specific guidance based on error code
+            switch (-ret) {
+                case EBUSY:
+                    NIXL_ERROR << "  Device is busy - another process may be using it";
+                    NIXL_ERROR << "  Try: fuser -v /dev/accel/accel*";
+                    break;
+                case ENOMEM:
+                    NIXL_ERROR << "  Device memory exhausted - try smaller allocation";
+                    NIXL_ERROR << "  Check device memory usage with habana monitoring tools";
+                    break;
+                case ENODEV:
+                    NIXL_ERROR << "  Device not available - check driver status";
+                    NIXL_ERROR << "  Try: systemctl status habana-driver";
+                    break;
+                case EFAULT:
+                    NIXL_ERROR << "  Invalid memory address - check DMA-BUF mapping";
+                    break;
+                default:
+                    NIXL_ERROR << "  SynapseAI device is busy or inaccessible.";
+                    break;
+            }
+            NIXL_ERROR << "  To use host memory: unset HABANA_VISIBLE_DEVICES";
+        } else {
+            NIXL_ERROR << "fi_mr_regattr failed: " << fi_strerror(-ret);
+        }
+        return NIXL_ERR_BACKEND;
+    }
+    
+    // Set descriptor for successful registration
+    ofi_meta->desc = fi_mr_desc(ofi_meta->mr);
+    
+    NIXL_DEBUG << "Memory registration successful:";
+    NIXL_DEBUG << "  addr=0x" << std::hex << mem.addr << " len=" << std::dec << mem.len;
+    NIXL_DEBUG << "  mr=" << ofi_meta->mr << " key=" << fi_mr_key(ofi_meta->mr);
+    NIXL_DEBUG << "  desc=" << ofi_meta->desc;
+    
+    return NIXL_SUCCESS;
 }
 
-// extract remote key from metadata
+bool nixlOfiEngine::isConnectionEstablished(const std::string& remote_agent) const {
+    std::lock_guard<std::mutex> lock(epLock_);
+    
+    if (isConnectionless_) {
+        bool found = avAddrs_.find(remote_agent) != avAddrs_.end();
+        NIXL_DEBUG << "connectionless address check for " << remote_agent << ": " 
+                  << (found ? "found" : "not found") << " (total AV entries: " << avAddrs_.size() << ")";
+        return found;
+    } else {
+        bool found = connectedEps_.find(remote_agent) != connectedEps_.end();
+        NIXL_DEBUG << "connection-oriented check for " << remote_agent << ": " 
+                  << (found ? "connected" : "not connected") << " (total connections: " << connectedEps_.size() << ")";
+        return found;
+    }
+}
+
+nixl_status_t nixlOfiEngine::validateTransferParams(const nixlMetaDesc& local_desc, 
+                                                     const nixlMetaDesc& remote_desc) const {
+    // check metadata pointers
+    if (!local_desc.metadataP || !remote_desc.metadataP) {
+        NIXL_ERROR << "null metadata pointers";
+        return NIXL_ERR_INVALID_PARAM;
+    }
+    
+    // check addresses and lengths
+    if (local_desc.addr == 0 || local_desc.len == 0 || 
+        remote_desc.addr == 0 || remote_desc.len == 0) {
+        NIXL_ERROR << "invalid address or length";
+        return NIXL_ERR_INVALID_PARAM;
+    }
+    
+    // check length match
+    if (local_desc.len != remote_desc.len) {
+        NIXL_ERROR << "length mismatch: local=" << local_desc.len 
+                  << " remote=" << remote_desc.len;
+        return NIXL_ERR_INVALID_PARAM;
+    }
+    
+    // validate local memory registration
+    nixlOfiMetadata *local_meta = static_cast<nixlOfiMetadata*>(local_desc.metadataP);
+    if (!local_meta->mr) {
+        NIXL_ERROR << "invalid local memory registration";
+        return NIXL_ERR_INVALID_PARAM;
+    }
+    
+    return NIXL_SUCCESS;
+}
+
 uint64_t nixlOfiEngine::getRemoteKey(nixlOfiMetadata* remote_meta) const {
     if (remote_meta->mr) {
         return fi_mr_key(remote_meta->mr);
@@ -1788,25 +2012,22 @@ uint64_t nixlOfiEngine::getRemoteKey(nixlOfiMetadata* remote_meta) const {
     }
 }
 
-// RDM readiness synchronization helpers
-void nixlOfiEngine::markLocalReady() {
-    std::lock_guard<std::mutex> lock(readinessMutex_);
-    localReady_ = true;
-    NIXL_DEBUG << "Local endpoint marked as ready for RDM operations";
+nixl_status_t nixlOfiEngine::handleCQError(fid_cq* cq, int error_ret) const {
+    if (error_ret == -FI_EAGAIN) {
+        return NIXL_IN_PROG;
+    }
+    
+    struct fi_cq_err_entry err_entry;
+    int err_ret = fi_cq_readerr(cq, &err_entry, 0);
+    if (err_ret > 0) {
+        NIXL_ERROR << "CQ error: " << fi_strerror(err_entry.err) << " (" << err_entry.err << ")";
+        // context will be cleaned up automatically by unique_ptr when request is destroyed
+        if (err_entry.op_context) {
+            NIXL_ERROR << "error context: " << err_entry.op_context;
+        }
+    } else {
+        NIXL_ERROR << "fi_cq_read failed: " << fi_strerror(-error_ret);
+    }
+    return NIXL_ERR_BACKEND;
 }
-
-void nixlOfiEngine::markRemoteReady(const std::string& remote_agent) {
-    std::lock_guard<std::mutex> lock(readinessMutex_);
-    remoteReadiness_[remote_agent] = true;
-    NIXL_DEBUG << "Remote endpoint " << remote_agent << " marked as ready";
-}
-
-bool nixlOfiEngine::areBothReady(const std::string& remote_agent) const {
-    std::lock_guard<std::mutex> lock(readinessMutex_);
-    // avoid calling isRemoteReady() which would cause deadlock
-    auto it = remoteReadiness_.find(remote_agent);
-    bool remote_ready = (it != remoteReadiness_.end()) && it->second;
-    return localReady_ && remote_ready;
-}
-
 

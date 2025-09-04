@@ -261,7 +261,13 @@ protected:
 
 TEST_F(OfiRequestTest, DefaultConstructor) {
     EXPECT_EQ(request->cq, nullptr);
-    EXPECT_EQ(request->wr_id, 0);
+    EXPECT_EQ(request->total_operations, 0);
+    EXPECT_EQ(request->completed_operations, 0);
+    EXPECT_FALSE(request->is_prepared);
+    EXPECT_FALSE(request->is_posted);
+    EXPECT_TRUE(request->op_contexts.empty());
+    EXPECT_TRUE(request->local_descs.empty());
+    EXPECT_TRUE(request->remote_descs.empty());
 }
 
 int main(int argc, char **argv) {

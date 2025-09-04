@@ -17,6 +17,7 @@
 
 #include "backend/backend_plugin.h"
 #include "ofi_backend.h"
+#include "common/nixl_log.h"
 
 namespace
 {
@@ -26,7 +27,15 @@ namespace
     // create a new OFI backend engine instance
     static nixlBackendEngine *
     create_ofi_engine (const nixlBackendInitParams *init_params) {
-        return new nixlOfiEngine (init_params);
+        try {
+            return new nixlOfiEngine (init_params);
+        } catch (const std::exception &e) {
+            NIXL_ERROR << "Failed to create OFI engine: " << e.what();
+            return nullptr;
+        } catch (...) {
+            NIXL_ERROR << "Failed to create OFI engine: unknown exception";
+            return nullptr;
+        }
     }
     
     static void

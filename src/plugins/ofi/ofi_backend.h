@@ -52,17 +52,35 @@ public:
 class nixlOfiRequest : public nixlBackendReqH {
 public:
     fid_cq *cq;
-    std::atomic<uint64_t> wr_id;
+    size_t total_operations;
+    size_t completed_operations;
+    bool is_prepared;
+    bool is_posted;
     
-    // context management for proper cleanup
-    std::vector<uint64_t*> active_contexts;
-    std::mutex context_lock;
+    // operation contexts for cleanup
+    std::vector<std::unique_ptr<uint64_t>> op_contexts;
     
-    nixlOfiRequest() : cq(nullptr), wr_id(0) { }
-    ~nixlOfiRequest() { cleanup_contexts(); }
+    // transfer parameters for delayed execution
+    nixl_xfer_op_t operation;
+    std::vector<nixlMetaDesc> local_descs;
+    std::vector<nixlMetaDesc> remote_descs;
+    std::string remote_agent;
+    
+    nixlOfiRequest() : cq(nullptr), total_operations(0), completed_operations(0), 
+                       is_prepared(false), is_posted(false) { }
+    
+    ~nixlOfiRequest() {
+        // auto cleanup via unique_ptr
+    }
+    
+    // helper methods
+    bool isComplete() const { return completed_operations >= total_operations; }
+    size_t remainingOperations() const { return total_operations - completed_operations; }
     
 private:
-    void cleanup_contexts();
+    // disable copy
+    nixlOfiRequest(const nixlOfiRequest&) = delete;
+    nixlOfiRequest& operator=(const nixlOfiRequest&) = delete;
 };
 
 class nixlOfiEngine : public nixlBackendEngine {
@@ -100,6 +118,8 @@ public:
                           const std::string &remote_agent,
                           nixlBackendReqH* &handle,
                           const nixl_opt_b_args_t* opt_args=nullptr) const override;
+                          
+    nixl_status_t postPreparedXfer(nixlOfiRequest* ofi_req) const;
 
     nixl_status_t checkXfer(nixlBackendReqH* handle) const override;
     nixl_status_t releaseReqH(nixlBackendReqH* handle) const override;
@@ -137,7 +157,7 @@ private:
 
     // member functions
     void eq_event_loop();
-    bool isConnectionlessProvider() const;
+    
     nixl_status_t setupEndpoint(bool connection_oriented);
     static nixl_status_t getEndpointAddress(fid_ep* endpoint, std::string& address);
     static void detectHmemCapabilities(struct fi_info* fi_info,
@@ -161,11 +181,14 @@ private:
     static uint64_t getMemoryRegistrationAccessFlags(const struct fi_info* fi_info);
     fi_hmem_iface selectHmemInterface(const nixlBlobDesc &mem, uint64_t &device_id) const;
     nixl_status_t registerDramMemory(const nixlBlobDesc &mem, nixlOfiMetadata *ofi_meta) const;
+    nixl_status_t registerVramMemory(const nixlBlobDesc &mem, nixlOfiMetadata *ofi_meta) const;
     nixl_status_t registerHmemMemory(const nixlBlobDesc &mem, nixlOfiMetadata *ofi_meta, fi_hmem_iface iface, uint64_t device_id) const;
 
     // helper methods
     nixl_status_t handleCQError(fid_cq* cq, int error_ret) const;
     uint64_t getRemoteKey(nixlOfiMetadata* remote_meta) const;
+    bool isConnectionEstablished(const std::string& remote_agent) const;
+    nixl_status_t validateTransferParams(const nixlMetaDesc& local_desc, const nixlMetaDesc& remote_desc) const;
     
     // RDM readiness synchronization helpers
     void markLocalReady();
@@ -223,6 +246,43 @@ private:
     static synapseai_ops synapseai_ops_;
     
     nixl_status_t registerSynapseAIMemoryExplicit(const nixlBlobDesc &mem, nixlOfiMetadata *ofi_meta) const;
+
+    // connection model helpers
+    static inline bool decideConnectionlessFromInfo(const struct fi_info* info) {
+        if (!info || !info->ep_attr) return false;
+
+        // dgram is always connectionless
+        if (info->ep_attr->type == FI_EP_DGRAM) return true;
+
+        // rdm is always connectionless (including rxm which emulates rdm over msg)
+        if (info->ep_attr->type == FI_EP_RDM) {
+            return true;
+        }
+
+        // msg and everything else: connection-oriented
+        return false;
+    }
+
+    // fallback used only before fi_getinfo() succeeds
+    static inline bool decideConnectionlessFromName(const std::string& prov) {
+        // rxm is connectionless (emulates rdm over msg)
+        if (prov.find("ofi_rxm") != std::string::npos) return true;
+
+        // common connectionless providers
+        if (prov.find("shm") != std::string::npos) return true;
+        if (prov == "udp" || prov == "tcp_rdm") return true;
+        
+        // plain tcp is msg (connection-oriented)
+        if (prov == "tcp") return false;
+
+        // verbs alone is msg
+        if (prov.find("verbs") != std::string::npos) return false;
+
+        // unknown: be conservative
+        return false;
+    }
+
+
 };
 
 #endif
