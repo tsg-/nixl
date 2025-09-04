@@ -140,15 +140,15 @@ nixlOfiEngine::nixlOfiEngine(const nixlBackendInitParams* init_params) :
     }
 
     // debug print all hints
-    NIXL_DEBUG << "=== constructor: fi_getinfo hints ===";
-    NIXL_DEBUG << "provider name: " << hints->fabric_attr->prov_name;
-    NIXL_DEBUG << "caps: " << fi_tostr(&hints->caps, FI_TYPE_CAPS);
-    NIXL_DEBUG << "mode: " << fi_tostr(&hints->mode, FI_TYPE_MODE);
-    NIXL_DEBUG << "ep_attr->type: " << fi_tostr(&hints->ep_attr->type, FI_TYPE_EP_TYPE);
-    NIXL_DEBUG << "domain_attr->mr_mode: " << fi_tostr(&hints->domain_attr->mr_mode, FI_TYPE_MR_MODE);
-    NIXL_DEBUG << "domain_attr->resource_mgmt: " << hints->domain_attr->resource_mgmt;
-    NIXL_DEBUG << "addr_format: " << fi_tostr(&hints->addr_format, FI_TYPE_ADDR_FORMAT);
-    NIXL_DEBUG << "========================";
+    NIXL_INFO << "=== constructor: fi_getinfo hints ===";
+    NIXL_INFO << "provider name: " << hints->fabric_attr->prov_name;
+    NIXL_INFO << "caps: " << fi_tostr(&hints->caps, FI_TYPE_CAPS);
+    NIXL_INFO << "mode: " << fi_tostr(&hints->mode, FI_TYPE_MODE);
+    NIXL_INFO << "ep_attr->type: " << fi_tostr(&hints->ep_attr->type, FI_TYPE_EP_TYPE);
+    NIXL_INFO << "domain_attr->mr_mode: " << fi_tostr(&hints->domain_attr->mr_mode, FI_TYPE_MR_MODE);
+    NIXL_INFO << "domain_attr->resource_mgmt: " << hints->domain_attr->resource_mgmt;
+    NIXL_INFO << "addr_format: " << fi_tostr(&hints->addr_format, FI_TYPE_ADDR_FORMAT);
+    NIXL_INFO << "========================";
 
     // let libfabric choose optimal settings; only override if explicitly needed
 
