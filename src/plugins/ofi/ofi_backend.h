@@ -27,7 +27,6 @@
 #include <rdma/fi_endpoint.h>
 #include <rdma/fi_cm.h>
 #include <rdma/fi_eq.h>
-// #include <rdma/fi_cq.h>
 #include <rdma/fi_ext.h>
 
 #include <dlfcn.h>
@@ -51,7 +50,6 @@ public:
 
 class nixlOfiRequest : public nixlBackendReqH {
 public:
-    fid_cq *cq;
     size_t total_operations;
     size_t completed_operations;
     bool is_prepared;
@@ -66,7 +64,7 @@ public:
     std::vector<nixlMetaDesc> remote_descs;
     std::string remote_agent;
     
-    nixlOfiRequest() : cq(nullptr), total_operations(0), completed_operations(0), 
+    nixlOfiRequest() : total_operations(0), completed_operations(0), 
                        is_prepared(false), is_posted(false) { }
     
     ~nixlOfiRequest() {
@@ -200,6 +198,9 @@ private:
     fid_domain *domain_;
     fid_ep *ep_;
     fid_cq *cq_;
+    fid_cntr *txcntr_;
+    fid_cntr *rxcntr_;
+    fid_cntr *rma_cntr_;
     fid_eq *eq_;
     fid_pep *pep_;
     struct fi_info *fi_;

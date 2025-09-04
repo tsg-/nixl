@@ -39,6 +39,9 @@ nixlOfiEngine::nixlOfiEngine(const nixlBackendInitParams* init_params) :
     domain_(nullptr),
     ep_(nullptr),
     cq_(nullptr),
+    txcntr_(nullptr),
+    rxcntr_(nullptr),
+    rma_cntr_(nullptr),
     eq_(nullptr),
     pep_(nullptr),
     fi_(nullptr),
@@ -273,11 +276,14 @@ nixlOfiEngine::nixlOfiEngine(const nixlBackendInitParams* init_params) :
     return;
 
 cleanup_teardown:
-    if (ep_)     { fi_close(&ep_->fid);     ep_ = nullptr; }
-    if (av_)     { fi_close(&av_->fid);     av_ = nullptr; }
-    if (pep_)    { fi_close(&pep_->fid);    pep_ = nullptr; }
-    if (eq_)     { fi_close(&eq_->fid);     eq_ = nullptr; }
-    if (cq_)     { fi_close(&cq_->fid);     cq_ = nullptr; }
+    if (ep_)        { fi_close(&ep_->fid);        ep_ = nullptr; }
+    if (av_)        { fi_close(&av_->fid);        av_ = nullptr; }
+    if (pep_)       { fi_close(&pep_->fid);       pep_ = nullptr; }
+    if (eq_)        { fi_close(&eq_->fid);        eq_ = nullptr; }
+    if (rma_cntr_)  { fi_close(&rma_cntr_->fid);  rma_cntr_ = nullptr; }
+    if (rxcntr_)    { fi_close(&rxcntr_->fid);    rxcntr_ = nullptr; }
+    if (txcntr_)    { fi_close(&txcntr_->fid);    txcntr_ = nullptr; }
+    if (cq_)        { fi_close(&cq_->fid);        cq_ = nullptr; }
     if (domain_) { fi_close(&domain_->fid); domain_ = nullptr; }
     if (fabric_) { fi_close(&fabric_->fid); fabric_ = nullptr; }
     if (fi_)     { fi_freeinfo(fi_);        fi_ = nullptr; info = nullptr; }
@@ -449,9 +455,12 @@ nixlOfiEngine::~nixlOfiEngine() {
         fi_close(&val->fid);
     }
 
-    if (pep_)    { fi_close(&pep_->fid);    pep_ = nullptr; }
-    if (ep_)     { fi_close(&ep_->fid);     ep_ = nullptr; }
-    if (cq_)     { fi_close(&cq_->fid);     cq_ = nullptr; }
+    if (pep_)       { fi_close(&pep_->fid);       pep_ = nullptr; }
+    if (ep_)        { fi_close(&ep_->fid);        ep_ = nullptr; }
+    if (rma_cntr_)  { fi_close(&rma_cntr_->fid);  rma_cntr_ = nullptr; }
+    if (rxcntr_)    { fi_close(&rxcntr_->fid);    rxcntr_ = nullptr; }
+    if (txcntr_)    { fi_close(&txcntr_->fid);    txcntr_ = nullptr; }
+    if (cq_)        { fi_close(&cq_->fid);        cq_ = nullptr; }
     if (eq_)     { fi_close(&eq_->fid);     eq_ = nullptr; }
     if (av_)     { fi_close(&av_->fid);     av_ = nullptr; }
     if (domain_) { fi_close(&domain_->fid); domain_ = nullptr; }
@@ -827,8 +836,7 @@ nixl_status_t nixlOfiEngine::prepXfer(const nixl_xfer_op_t &operation,
     }
     
     // store parameters for later execution
-    ofi_req->cq = cq_;
-    NIXL_DEBUG << "prepXfer: created request with cq=" << ofi_req->cq << " (engine cq=" << cq_ << ")";
+    NIXL_DEBUG << "prepXfer: created request for counter-based completion";
     ofi_req->operation = operation;
     ofi_req->remote_agent = remote_agent;
     ofi_req->total_operations = static_cast<size_t>(local.descCount());
@@ -1007,14 +1015,14 @@ nixl_status_t nixlOfiEngine::postPreparedXfer(nixlOfiRequest* ofi_req) const {
 
 nixl_status_t nixlOfiEngine::checkXfer(nixlBackendReqH* handle) const {
     nixlOfiRequest *ofi_req = static_cast<nixlOfiRequest*>(handle);
-    if (!ofi_req || !ofi_req->cq) {
-        NIXL_ERROR << "checkXfer: invalid request or CQ";
+    if (!ofi_req) {
+        NIXL_ERROR << "checkXfer: invalid request handle";
         return NIXL_ERR_INVALID_PARAM;
     }
 
     if (!ofi_req->is_posted) {
         NIXL_ERROR << "checkXfer: request not posted yet";
-        return NIXL_ERR_INVALID_PARAM; // request not posted yet
+        return NIXL_ERR_INVALID_PARAM;
     }
 
     NIXL_DEBUG << "checkXfer: completed=" << ofi_req->completed_operations 
@@ -1025,39 +1033,32 @@ nixl_status_t nixlOfiEngine::checkXfer(nixlBackendReqH* handle) const {
         return NIXL_SUCCESS;
     }
 
-    // read available completions
-    const size_t batch_size = 16;
-    // struct fi_cq_data_entry entries[batch_size];
-    struct fi_cq_entry entries[batch_size];
-    int ret = fi_cq_read(ofi_req->cq, entries, batch_size);
-    
-    NIXL_DEBUG << "checkXfer: fi_cq_read returned " << ret;
-    
-    if (ret > 0) {
-        // update completion count
-        ofi_req->completed_operations += static_cast<size_t>(ret);
-        NIXL_DEBUG << "checkXfer: got " << ret << " completions, total completed=" 
-                  << ofi_req->completed_operations << "/" << ofi_req->total_operations;
-        
-        // log completion contexts for debugging
-        for (int i = 0; i < ret; ++i) {
-            NIXL_DEBUG << "checkXfer: completion " << i << " context=" << entries[i].op_context;
-        }
-        
-        if (ofi_req->isComplete()) {
-            NIXL_DEBUG << "checkXfer: all operations completed - SUCCESS";
-            return NIXL_SUCCESS;
-        }
-        return NIXL_IN_PROG;
-    } else if (ret == -FI_EAGAIN) {
-        NIXL_DEBUG << "checkXfer: no completions available (EAGAIN)";
-        return NIXL_IN_PROG;
-    } else if (ret < 0) {
-        NIXL_ERROR << "checkXfer: CQ error, calling handleCQError";
-        return handleCQError(ofi_req->cq, ret);
+    // use counter-based completion for RMA operations (following fabtests pattern)
+    fid_cntr* completion_cntr = (rma_cntr_ && (fi_->caps & FI_RMA_EVENT)) ? rma_cntr_ : txcntr_;
+    if (!completion_cntr) {
+        NIXL_ERROR << "checkXfer: no completion counter available";
+        return NIXL_ERR_BACKEND;
     }
+
+    // read current counter value
+    uint64_t current_count = fi_cntr_read(completion_cntr);
     
-    return NIXL_IN_PROG;
+    NIXL_DEBUG << "checkXfer: counter current=" << current_count 
+              << " expected=" << ofi_req->total_operations;
+
+    // update completion count based on counter progress
+    if (current_count >= ofi_req->total_operations) {
+        ofi_req->completed_operations = ofi_req->total_operations;
+        NIXL_DEBUG << "checkXfer: counter indicates all operations completed - SUCCESS";
+        return NIXL_SUCCESS;
+    } else if (current_count > ofi_req->completed_operations) {
+        ofi_req->completed_operations = current_count;
+        NIXL_DEBUG << "checkXfer: counter progress: " << current_count << "/" << ofi_req->total_operations;
+        return NIXL_IN_PROG;
+    } else {
+        NIXL_DEBUG << "checkXfer: no counter progress yet";
+        return NIXL_IN_PROG;
+    }
 }
 
 #if 0
@@ -1374,6 +1375,62 @@ nixl_status_t nixlOfiEngine::setupEndpoint(bool use_passive_endpoint) {
         goto cleanup_setup;
     }
 
+    // create and bind counters for RMA operations
+    {
+        struct fi_cntr_attr cntr_attr = {};
+        cntr_attr.events = FI_CNTR_EVENTS_COMP;
+        
+        // TX counter for outgoing RMA operations
+        ret = fi_cntr_open(domain_, &cntr_attr, &txcntr_, nullptr);
+        if (ret) {
+            NIXL_ERROR << "fi_cntr_open for txcntr failed: " << fi_strerror(-ret);
+            goto cleanup_setup;
+        }
+        
+        // bind TX counter to endpoint with RMA flags
+        ret = fi_ep_bind(ep_, &txcntr_->fid, FI_SEND | FI_WRITE | FI_READ);
+        if (ret) {
+            NIXL_ERROR << "fi_ep_bind txcntr failed: " << fi_strerror(-ret);
+            goto cleanup_setup;
+        }
+
+        // RX counter for incoming operations (if needed)
+        ret = fi_cntr_open(domain_, &cntr_attr, &rxcntr_, nullptr);
+        if (ret) {
+            NIXL_ERROR << "fi_cntr_open for rxcntr failed: " << fi_strerror(-ret);
+            goto cleanup_setup;
+        }
+        
+        // bind RX counter to endpoint
+        ret = fi_ep_bind(ep_, &rxcntr_->fid, FI_RECV);
+        if (ret) {
+            NIXL_ERROR << "fi_ep_bind rxcntr failed: " << fi_strerror(-ret);
+            goto cleanup_setup;
+        }
+
+        // RMA counter for remote operations (if provider supports FI_RMA_EVENT)
+        if (fi_->caps & FI_RMA_EVENT) {
+            ret = fi_cntr_open(domain_, &cntr_attr, &rma_cntr_, nullptr);
+            if (ret) {
+                NIXL_ERROR << "fi_cntr_open for rma_cntr failed: " << fi_strerror(-ret);
+                goto cleanup_setup;
+            }
+            
+            // bind RMA counter with remote flags
+            uint64_t rma_flags = fi_->caps & (FI_REMOTE_WRITE | FI_REMOTE_READ);
+            ret = fi_ep_bind(ep_, &rma_cntr_->fid, rma_flags);
+            if (ret) {
+                NIXL_ERROR << "fi_ep_bind rma_cntr failed: " << fi_strerror(-ret);
+                goto cleanup_setup;
+            }
+            
+            NIXL_DEBUG << "RMA counter bound with flags: " << rma_flags;
+        } else {
+            rma_cntr_ = nullptr;
+            NIXL_DEBUG << "Provider does not support FI_RMA_EVENT, using txcntr for RMA completions";
+        }
+    }
+
     if (use_passive_endpoint) {
         // event queue for connection management
         struct fi_eq_attr eq_attr = {};
@@ -1449,12 +1506,15 @@ nixl_status_t nixlOfiEngine::setupEndpoint(bool use_passive_endpoint) {
 
 cleanup_setup:
     // cleanup only what setupEndpoint created, set pointers to nullptr
-    // Close endpoint BEFORE CQ since EP depends on CQ
-    if (ep_)  { fi_close(&ep_->fid);  ep_ = nullptr; }
-    if (av_)  { fi_close(&av_->fid);  av_ = nullptr; }
-    if (pep_) { fi_close(&pep_->fid); pep_ = nullptr; }
-    if (eq_)  { fi_close(&eq_->fid);  eq_ = nullptr; }
-    if (cq_)  { fi_close(&cq_->fid);  cq_ = nullptr; }
+    // Close endpoint BEFORE counters and CQ since EP depends on them
+    if (ep_)        { fi_close(&ep_->fid);        ep_ = nullptr; }
+    if (av_)        { fi_close(&av_->fid);        av_ = nullptr; }
+    if (pep_)       { fi_close(&pep_->fid);       pep_ = nullptr; }
+    if (eq_)        { fi_close(&eq_->fid);        eq_ = nullptr; }
+    if (rma_cntr_)  { fi_close(&rma_cntr_->fid);  rma_cntr_ = nullptr; }
+    if (rxcntr_)    { fi_close(&rxcntr_->fid);    rxcntr_ = nullptr; }
+    if (txcntr_)    { fi_close(&txcntr_->fid);    txcntr_ = nullptr; }
+    if (cq_)        { fi_close(&cq_->fid);        cq_ = nullptr; }
     return NIXL_ERR_BACKEND;
 }
 

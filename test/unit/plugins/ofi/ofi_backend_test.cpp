@@ -260,7 +260,6 @@ protected:
 };
 
 TEST_F(OfiRequestTest, DefaultConstructor) {
-    EXPECT_EQ(request->cq, nullptr);
     EXPECT_EQ(request->total_operations, 0);
     EXPECT_EQ(request->completed_operations, 0);
     EXPECT_FALSE(request->is_prepared);
