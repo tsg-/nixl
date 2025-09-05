@@ -22,6 +22,8 @@
 #include <rdma/fi_domain.h>
 #include "habanalabs/synapse_api.h"
 #include <cstdint>
+#include <string>
+#include <nixl_types.h>
 
 namespace nixlOfiUtils {
 
@@ -64,6 +66,43 @@ struct AlignedBuffer {
 };
 
 AlignedBuffer calculateAlignment(uint64_t addr, size_t size, size_t page_size = 4096);
+
+// provider configuration
+struct ProviderConfig {
+    std::string name;
+    enum fi_ep_type ep_type;
+    uint64_t caps;
+    uint64_t mode;
+    uint64_t mr_mode;
+    fi_resource_mgmt resource_mgmt;
+    struct fi_tx_attr tx_attr;
+    struct fi_rx_attr rx_attr;
+    uint32_t addr_format;
+    enum fi_progress data_progress;
+    enum fi_progress control_progress;
+};
+
+const ProviderConfig* findProviderConfig(const std::string& provider_name);
+
+// ofi initialization utilities
+struct OfiInitConfig {
+    std::string providerName;
+    bool needHmem;
+    struct fi_info* hints;
+    struct fi_info* result;
+    
+    OfiInitConfig(const std::string& provider, bool hmem) 
+        : providerName(provider), needHmem(hmem), hints(nullptr), result(nullptr) {}
+    ~OfiInitConfig() {
+        if (hints) { fi_freeinfo(hints); hints = nullptr; }
+        if (result) { fi_freeinfo(result); result = nullptr; }
+    }
+};
+
+nixl_status_t initializeOFI(OfiInitConfig& config);
+nixl_status_t createAndConfigureHints(OfiInitConfig& config);
+nixl_status_t performFiGetinfo(OfiInitConfig& config);
+void configureHintsForProvider(struct fi_info* hints, const std::string& provider_name);
 
 } // namespace nixlOfiUtils
 

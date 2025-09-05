@@ -48,6 +48,7 @@ nixlOfiEngine::nixlOfiEngine(const nixlBackendInitParams* init_params) :
     cachedProviderInfo_(nullptr),
     av_(nullptr),
     isConnectionless_(false),
+    localReady_(false),
     eqThreadStop_(false),
     eqThreadPaused_(false),
     eqTimeoutMs_(100),
@@ -75,7 +76,7 @@ nixlOfiEngine::nixlOfiEngine(const nixlBackendInitParams* init_params) :
     bool useMinimalConfig = (providerName_ == "shm" || providerName_ == "tcp" || 
                              providerName_ == "tcp;ofi_rxm" || providerName_ == "verbs;ofi_rxm");
     if (!useMinimalConfig) {
-        const auto* config = findProviderConfig(providerName_);
+        const auto* config = nixlOfiUtils::findProviderConfig(providerName_);
         if (!config) {
             NIXL_ERROR << "Unsupported provider: " << providerName_;
             NIXL_ERROR << "Supported providers: shm, tcp, tcp;ofi_rxm, verbs, verbs;ofi_rxm";
@@ -87,13 +88,19 @@ nixlOfiEngine::nixlOfiEngine(const nixlBackendInitParams* init_params) :
     // get EQ timeout parameter (0-60 seconds max)
     getLongParam(init_params, "eq_timeout_ms", eqTimeoutMs_, 0, 60000);
 
-    // initialize OFI with provider-specific configuration
-    nixl_status_t init_status = initializeOFI();
+    // initialize OFI with provider-specific configuration using utility
+    bool need_hmem = hmemManager_->determineHmemSupport();
+    nixlOfiUtils::OfiInitConfig ofi_config(providerName_, need_hmem);
+    
+    nixl_status_t init_status = nixlOfiUtils::initializeOFI(ofi_config);
     if (init_status != NIXL_SUCCESS) {
         goto cleanup_teardown;
     }
 
-    // fi_ was assigned in performFiGetinfo(), verify it was successful
+    // transfer ownership of fi_info result from config to class member
+    fi_ = ofi_config.result;
+    ofi_config.result = nullptr; // prevent destruction
+    
     if (!fi_) {
         NIXL_ERROR << "No providers returned by fi_getinfo";
         goto cleanup_teardown;
@@ -240,115 +247,7 @@ void nixlOfiEngine::getSizeTParam(const nixlBackendInitParams* init_params, cons
     }
 }
 
-// predefined provider configurations for providers that need explicit settings
-// Note: SHM and TCP providers use minimal auto-negotiated configuration instead
-const nixlOfiEngine::ProviderConfig nixlOfiEngine::SUPPORTED_PROVIDERS[] = {
-    {   
-        "shm",
-        FI_EP_RDM,
-        FI_HMEM, // not implemented Gaudi HBM
-        0,  // let provider choose mode
-        0,  // let provider choose MR mode  
-        FI_RM_UNSPEC,
-        {0, 0, 0, 0, 0, 0, 0, 0, FI_TC_UNSPEC}, // tx_attr defaults
-        {0, 0, 0, 0, 0, 0}, // rx_attr defaults
-        FI_FORMAT_UNSPEC,
-        FI_PROGRESS_AUTO,
-        FI_PROGRESS_AUTO
-    },
-    {
-        "tcp",
-        FI_EP_MSG,
-        FI_MSG | FI_RMA | FI_READ | FI_WRITE,
-        FI_CONTEXT | FI_CONTEXT2,
-        0, // let provider choose mr_mode
-        FI_RM_ENABLED,
-        {0, 0, 0, 0, 0, 0, 0, 0, FI_TC_BULK_DATA}, // tx_attr with bulk data class
-        {0, 0, 0, 0, 0, 0}, // rx_attr defaults
-        FI_FORMAT_UNSPEC,
-        FI_PROGRESS_MANUAL,
-        FI_PROGRESS_MANUAL
-    },
-    {
-        // Match verbs;ofi_rxm capabilities from fi_info output
-        "verbs",
-        FI_EP_RDM,
-        FI_MSG | FI_RMA | FI_READ | FI_WRITE | FI_RECV | FI_SEND | FI_REMOTE_READ | FI_REMOTE_WRITE | FI_MULTI_RECV | FI_LOCAL_COMM | FI_REMOTE_COMM | FI_HMEM,
-        0,
-        FI_MR_LOCAL | FI_MR_VIRT_ADDR | FI_MR_ALLOCATED | FI_MR_PROV_KEY | FI_MR_HMEM,
-        FI_RM_ENABLED,
-        {0, 0, 0, 0, 0, 0, 0, 0, FI_TC_BULK_DATA}, // tx_attr with bulk data class like fabtests
-        {0, 0, 0, 0, 0, 0}, // rx_attr defaults
-        FI_FORMAT_UNSPEC,
-        FI_PROGRESS_AUTO,
-        FI_PROGRESS_MANUAL
-    }
-};
 
-const size_t nixlOfiEngine::NUM_SUPPORTED_PROVIDERS =
-    sizeof(SUPPORTED_PROVIDERS) / sizeof(SUPPORTED_PROVIDERS[0]);
-
-const nixlOfiEngine::ProviderConfig* nixlOfiEngine::findProviderConfig(const std::string& provider_name) {
-    for (size_t i = 0; i < NUM_SUPPORTED_PROVIDERS; ++i) {
-        if (SUPPORTED_PROVIDERS[i].name == provider_name) {
-            return &SUPPORTED_PROVIDERS[i];
-        }
-    }
-    return nullptr;
-}
-
-void nixlOfiEngine::configureHintsForProvider(struct fi_info* hints, const std::string& provider_name) {
-    const auto* config = findProviderConfig(provider_name);
-
-    if (!config) {
-        // if the provider is not in our list, use the verbs config as a safe default
-        config = findProviderConfig("verbs");
-        NIXL_DEBUG << "Unknown provider '" << provider_name << "', using verbs config as a fallback.";
-    } else {
-        NIXL_DEBUG << "Using predefined config for provider: " << provider_name;
-    }
-
-    // apply the configuration from the data structure
-    hints->ep_attr->type = config->ep_type;
-    hints->domain_attr->resource_mgmt = config->resource_mgmt;
-    hints->caps = config->caps;
-    hints->mode = config->mode;
-
-    if (config->mr_mode != 0) {
-        hints->domain_attr->mr_mode = config->mr_mode;
-    }
-
-    // apply tx/rx attributes
-    if (config->tx_attr.tclass != 0) {
-        hints->tx_attr->tclass = config->tx_attr.tclass;
-    }
-    // other tx_attr fields can be added here as needed
-    
-    // rx_attr fields can be added here as needed
-
-    // address format - only set if not UNSPEC
-    if (config->addr_format != FI_FORMAT_UNSPEC) {
-        hints->addr_format = config->addr_format;
-    }
-
-    // progress models - only set if not UNSPEC 
-    if (config->data_progress != FI_PROGRESS_UNSPEC) {
-        hints->domain_attr->data_progress = config->data_progress;
-    }
-    if (config->control_progress != FI_PROGRESS_UNSPEC) {
-        hints->domain_attr->control_progress = config->control_progress;
-    }
-
-    // enable shared RX context for verbs providers to use XRC endpoints like fabtests
-    // but only for connection-oriented (FI_EP_MSG) endpoints, not RDM
-    if (provider_name.find("verbs") != std::string::npos && config->ep_type == FI_EP_MSG) {
-        hints->ep_attr->rx_ctx_cnt = FI_SHARED_CONTEXT;
-    }
-
-    // always set the provider name in the hints
-    if (hints->fabric_attr->prov_name) free(hints->fabric_attr->prov_name);
-    hints->fabric_attr->prov_name = strdup(provider_name.c_str());
-}
 
 nixlOfiEngine::~nixlOfiEngine() {
     if (!isConnectionless_) {
@@ -379,6 +278,7 @@ nixlOfiEngine::~nixlOfiEngine() {
     if (domain_) { fi_close(&domain_->fid); domain_ = nullptr; }
     if (fabric_) { fi_close(&fabric_->fid); fabric_ = nullptr; }
     if (cachedProviderInfo_) fi_freeinfo(cachedProviderInfo_);
+    if (fi_) fi_freeinfo(fi_);
 
     // note: static handles are shared across instances
     // cleanup is handled by OS when process exits
@@ -1448,39 +1348,6 @@ nixl_status_t nixlOfiEngine::getEndpointAddress(fid_ep* endpoint, std::string& a
     return NIXL_SUCCESS;
 }
 
-void nixlOfiEngine::detectHmemCapabilities(struct fi_info* fi_info,
-                                            const std::string& provider_name,
-                                            bool& cuda_supported,
-                                            bool& ze_supported,
-                                            bool& synapseai_supported) {
-    // Check if provider supports generic HMEM capability
-    if (!fi_info || !(fi_info->caps & FI_HMEM)) {
-        NIXL_DEBUG << "Provider " << provider_name << " does not support generic HMEM";
-        
-        // Special cases: providers that support SynapseAI through DMA buffers
-        // even without advertising FI_HMEM capability
-        if (provider_name == "verbs" || provider_name == "verbs;ofi_rxm") {
-            synapseai_supported = true;
-        } else {
-            synapseai_supported = false;
-        }
-        
-        cuda_supported = false;
-        ze_supported = false;
-        return;
-    }
-
-    NIXL_DEBUG << "Provider " << provider_name << " supports generic HMEM capability";
-
-    // for now, conservatively enable all interfaces if HMEM is supported
-    // TODO: determine which specific interfaces actually work
-    cuda_supported = true;
-    ze_supported = true; 
-    synapseai_supported = true;
-
-    NIXL_DEBUG << "HMEM interfaces marked as potentially available - runtime detection will validate";
-}
-
 
 fi_hmem_iface nixlOfiHmemManager::selectHmemInterface(const nixlBlobDesc &mem, uint64_t &device_id) const {
     device_id = mem.devId >= 0 ? mem.devId : 0;
@@ -1996,95 +1863,4 @@ void nixlOfiHmemManager::initializeHmemCapabilities() {
 
 // OFI initialization helper functions
 
-nixl_status_t nixlOfiEngine::initializeOFI() {
-    // step 1: determine HMEM support requirements
-    bool need_hmem = hmemManager_->determineHmemSupport();
-    NIXL_INFO << "HMEM support requested: " << (need_hmem ? "YES" : "NO");
-    
-    // step 2: create and configure hints with all required capabilities
-    nixl_status_t status = createAndConfigureHints(need_hmem);
-    if (status != NIXL_SUCCESS) {
-        return status;
-    }
-    
-    // step 3: perform fi_getinfo with fallback handling
-    return performFiGetinfo();
-}
-
-
-nixl_status_t nixlOfiEngine::createAndConfigureHints(bool need_hmem) {
-    hints_ = fi_allocinfo();
-    if (!hints_) {
-        NIXL_ERROR << "fi_allocinfo failed";
-        return NIXL_ERR_BACKEND;
-    }
-
-    // set provider name first
-    hints_->fabric_attr->prov_name = strdup(providerName_.c_str());
-    
-    // configure provider-specific settings
-    if (providerName_ == "shm" || providerName_ == "tcp" || 
-        providerName_ == "tcp;ofi_rxm" || providerName_ == "verbs;ofi_rxm") {
-        NIXL_DEBUG << "Using minimal auto-negotiated hints for " << providerName_ << " provider";
-        // for RXM providers, start with minimal configuration and add capabilities
-    } else {
-        // for other providers, use predefined configuration from SUPPORTED_PROVIDERS  
-        configureHintsForProvider(hints_, providerName_);
-    }
-
-    // add HMEM support if requested
-    if (need_hmem) {
-        hints_->caps |= FI_HMEM;
-        NIXL_DEBUG << "Adding FI_HMEM to hints->caps for device memory support";
-    }
-
-    // force RMA capabilities
-    hints_->caps |= FI_RMA | FI_READ | FI_WRITE | FI_REMOTE_READ | FI_REMOTE_WRITE;
-    NIXL_INFO << "Adding RMA capabilities to hints: FI_RMA | FI_READ | FI_WRITE | FI_REMOTE_READ | FI_REMOTE_WRITE";
-
-    // debug print all configured hints
-    NIXL_INFO << "=== constructor: fi_getinfo hints ===";
-    NIXL_INFO << "provider name: " << hints_->fabric_attr->prov_name;
-    NIXL_INFO << "caps: " << fi_tostr(&hints_->caps, FI_TYPE_CAPS);
-    NIXL_INFO << "mode: " << fi_tostr(&hints_->mode, FI_TYPE_MODE);
-    NIXL_INFO << "ep_attr->type: " << fi_tostr(&hints_->ep_attr->type, FI_TYPE_EP_TYPE);
-    NIXL_INFO << "domain_attr->mr_mode: " << fi_tostr(&hints_->domain_attr->mr_mode, FI_TYPE_MR_MODE);
-    NIXL_INFO << "domain_attr->resource_mgmt: " << hints_->domain_attr->resource_mgmt;
-    NIXL_INFO << "addr_format: " << fi_tostr(&hints_->addr_format, FI_TYPE_ADDR_FORMAT);
-    NIXL_INFO << "========================";
-    
-    return NIXL_SUCCESS;
-}
-
-nixl_status_t nixlOfiEngine::performFiGetinfo() {
-    struct fi_info *info = nullptr;
-    
-    // let libfabric choose optimal settings; only override if explicitly needed
-    int ret = fi_getinfo(FI_VERSION(1, 20), nullptr, nullptr, 0, hints_, &info);
-    if (ret) {
-        NIXL_ERROR << "fi_getinfo failed: " << fi_strerror(-ret);
-        NIXL_DEBUG << "Trying fi_getinfo with minimal hints for provider " << providerName_;
-        
-        // fallback: try with minimal hints to see what provider supports
-        struct fi_info *minimal_hints = fi_allocinfo();
-        if (minimal_hints) {
-            minimal_hints->fabric_attr->prov_name = strdup(providerName_.c_str());
-            struct fi_info *minimal_fi = nullptr;
-            int minimal_ret = fi_getinfo(FI_VERSION(1, 18), nullptr, nullptr, 0, minimal_hints, &minimal_fi);
-            if (minimal_ret == 0) {
-                NIXL_DEBUG << "Provider " << providerName_ << " supports: caps=0x" << std::hex << minimal_fi->caps 
-                         << " ep_type=" << minimal_fi->ep_attr->type;
-                fi_freeinfo(minimal_fi);
-            } else {
-                NIXL_ERROR << "Even minimal fi_getinfo failed: " << fi_strerror(-minimal_ret);
-            }
-            fi_freeinfo(minimal_hints);
-        }
-        return NIXL_ERR_BACKEND;
-    }
-    
-    // assign the successful result to fi_ member
-    fi_ = info;
-    return NIXL_SUCCESS;
-}
 

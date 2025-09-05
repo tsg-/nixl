@@ -161,35 +161,12 @@ public:
 
 private:
     // type definitions and nested classes
-    struct ProviderConfig {
-        std::string name;
-        enum fi_ep_type ep_type;
-        uint64_t caps;
-        uint64_t mode;
-        uint64_t mr_mode;
-        fi_resource_mgmt resource_mgmt;
-        struct fi_tx_attr tx_attr;
-        struct fi_rx_attr rx_attr;
-        uint32_t addr_format;
-        enum fi_progress data_progress;
-        enum fi_progress control_progress;
-    };
-    
-    // static member variables
-    static const ProviderConfig SUPPORTED_PROVIDERS[];
-    static const size_t NUM_SUPPORTED_PROVIDERS;
 
     // member functions
     void eq_event_loop();
     
     nixl_status_t setupEndpoint(bool connection_oriented);
     static nixl_status_t getEndpointAddress(fid_ep* endpoint, std::string& address);
-    static void detectHmemCapabilities(struct fi_info* fi_info,
-                                       const std::string& provider_name,
-                                       bool& cuda_supported,
-                                       bool& ze_supported,
-                                       bool& synapseai_supported);
-    static const ProviderConfig* findProviderConfig(const std::string& provider_name);
     
     // parameter helpers
     void getStringParam(const nixlBackendInitParams* init_params, const std::string& key, std::string& value);
@@ -199,12 +176,7 @@ private:
     // connection helpers
     nixl_status_t connect_unlocked(const std::string &remote_agent);
     
-    void configureHintsForProvider(struct fi_info* hints, const std::string& provider_name);
     
-    // OFI initialization helpers
-    nixl_status_t initializeOFI();
-    nixl_status_t createAndConfigureHints(bool need_hmem);
-    nixl_status_t performFiGetinfo();
     
     // Memory registration helpers
     nixl_status_t registerDramMemory(const nixlBlobDesc &mem, nixlOfiMetadata *ofi_meta) const;
