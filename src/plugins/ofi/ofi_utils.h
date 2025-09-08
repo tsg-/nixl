@@ -27,6 +27,9 @@
 
 namespace nixlOfiUtils {
 
+// HMEM detection utilities
+bool determineHmemRequirement();
+
 // memory registration utilities
 uint64_t getMemoryRegistrationAccessFlags(const struct fi_info* fi_info);
 
@@ -103,6 +106,37 @@ nixl_status_t initializeOFI(OfiInitConfig& config);
 nixl_status_t createAndConfigureHints(OfiInitConfig& config);
 nixl_status_t performFiGetinfo(OfiInitConfig& config);
 void configureHintsForProvider(struct fi_info* hints, const std::string& provider_name);
+
+// post-fi_getinfo utilities
+void sanitizeProviderCapabilities(struct fi_info* info, const std::string& provider_name);
+
+// debug macros
+#define NIXL_DEBUG_MR_REGISTRATION_RESULT(buf, size, access_flags, mr_mode, key, mr_ptr) \
+    do { \
+        NIXL_INFO << "=== MR REGISTRATION DEBUG ==="; \
+        NIXL_INFO << "buf: 0x" << std::hex << (uint64_t)(buf) << std::dec; \
+        NIXL_INFO << "size: " << (size); \
+        NIXL_INFO << "access_flags: 0x" << std::hex << (access_flags) << std::dec; \
+        NIXL_INFO << "mr_mode: 0x" << std::hex << (mr_mode) << std::dec; \
+        NIXL_INFO << "requested_key: " << (key); \
+        if (mr_ptr) { \
+            NIXL_INFO << "fi_mr_reg SUCCESS: mr=" << (mr_ptr); \
+            NIXL_INFO << "fi_mr_key(*mr): " << fi_mr_key((fid_mr*)(mr_ptr)); \
+        } else { \
+            NIXL_ERROR << "fi_mr_reg FAILED"; \
+        } \
+        NIXL_INFO << "============================="; \
+    } while(0)
+
+// address conversion utilities
+std::string ofiSockaddrToString(const void* addr, size_t addrlen);
+
+// misc
+bool isTcpFamily(const std::string& prov);      // "tcp", "tcp;ofi_rxm"
+bool isRxmLayer(const std::string& prov);       // contains "ofi_rxm"
+bool isRxmProvider(const fi_info* info);
+bool isConnectionlessProvider(const fi_info* info);
+void normalizeHintsForProvider(struct fi_info* info, const std::string& prov);
 
 } // namespace nixlOfiUtils
 
