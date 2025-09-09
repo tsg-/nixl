@@ -214,20 +214,21 @@ static const ProviderConfig SUPPORTED_PROVIDERS[] = {
   // tcp (and tcp;ofi_rxm)
   { "tcp",
     FI_EP_RDM,                      // RDM, not MSG
-    /* caps */ FI_RMA | FI_READ | FI_WRITE | FI_REMOTE_READ | FI_REMOTE_WRITE,
+    /* caps */ FI_MSG | FI_RMA | FI_READ | FI_WRITE | FI_RECV | FI_SEND
+              | FI_REMOTE_READ | FI_REMOTE_WRITE | FI_LOCAL_COMM | FI_REMOTE_COMM,
     /* mode */ FI_CONTEXT | FI_CONTEXT2,
     /* mr_mode */ 0,                // provider decides
     FI_RM_ENABLED,
     /* tx_attr */ {0, 0, 0, 0, 0, 0, 0, 0, FI_TC_UNSPEC}, // use selective completion
     /* rx_attr */ {0, 0, 0, 0, 0, 0, 0, 0}, // use selective completion              // size=0 (or ≤ provider limit, e.g. 1024)
     FI_FORMAT_UNSPEC,
-    FI_PROGRESS_MANUAL,
-    FI_PROGRESS_MANUAL
+    FI_PROGRESS_AUTO,
+    FI_PROGRESS_AUTO
   },
 
   // verbs core (used under verbs;ofi_rxm) - let fi_getinfo determine endpoint type
   { "verbs",
-    FI_EP_UNSPEC,
+    FI_EP_RDM,                      // RDM, not MSG
     /* caps */ FI_MSG | FI_RMA | FI_READ | FI_WRITE | FI_RECV | FI_SEND
               | FI_REMOTE_READ | FI_REMOTE_WRITE | FI_LOCAL_COMM | FI_REMOTE_COMM,
     /* mode */ FI_CONTEXT,

@@ -461,6 +461,9 @@ nixl_status_t nixlOfiEngine::disconnect(const std::string &remote_agent) {
 nixl_status_t nixlOfiEngine::registerMem(const nixlBlobDesc &mem,
                                      const nixl_mem_t &nixl_mem,
                                      nixlBackendMD* &out) {
+    NIXL_INFO << "=== NIXL STATE: registerMem addr=0x" << std::hex << mem.addr 
+              << " len=" << std::dec << mem.len << " mem_type=" << nixl_mem << " ===";
+    
     nixlOfiMetadata *ofi_meta = new nixlOfiMetadata();
     if (!ofi_meta) {
         return NIXL_ERR_BACKEND;
@@ -496,6 +499,9 @@ nixl_status_t nixlOfiEngine::registerMem(const nixlBlobDesc &mem,
         delete ofi_meta;
         return NIXL_ERR_BACKEND;
     }
+
+    NIXL_INFO << "=== NIXL STATE: registerMem SUCCESS addr=0x" << std::hex << mem.addr 
+              << " mr_key=" << std::dec << fi_mr_key(ofi_meta->mr) << " desc=" << ofi_meta->desc << " ===";
 
     out = ofi_meta;
     return NIXL_SUCCESS;
@@ -539,6 +545,7 @@ nixl_status_t nixlOfiEngine::postXfer(const nixl_xfer_op_t &operation,
                                   const std::string &remote_agent,
                                   nixlBackendReqH* &handle,
                                   const nixl_opt_b_args_t* opt_args) const {
+    NIXL_INFO << "=== OFI postXfer called: op=" << operation << " local.size=" << local.descCount() << " remote.size=" << remote.descCount() << " ===";
     if (!ep_) {
         NIXL_ERROR << "Primary endpoint not initialized";
         return NIXL_ERR_BACKEND;
@@ -640,15 +647,20 @@ nixl_status_t nixlOfiEngine::postXfer(const nixl_xfer_op_t &operation,
             return NIXL_ERR_INVALID_PARAM;
         }
 
-        // get remote memory key - either from mr or stored in desc field for remote metadata
+        // get remote memory key 
         uint64_t remote_key;
         if (remote_meta->mr) {
+            // local metadata - use actual mr
             remote_key = fi_mr_key(remote_meta->mr);
+            NIXL_INFO << "OFI transfer " << i << " using local remote_key=" << remote_key;
         } else {
-            // for remote metadata, key is stored in desc field - safe extraction
-            uintptr_t desc_as_ptr = reinterpret_cast<uintptr_t>(remote_meta->desc);
-            remote_key = static_cast<uint64_t>(desc_as_ptr);
+            // remote metadata - extract key from desc field
+            remote_key = reinterpret_cast<uintptr_t>(remote_meta->desc);
+            NIXL_INFO << "OFI transfer " << i << " using remote remote_key=" << remote_key;
         }
+        
+        NIXL_INFO << "OFI transfer " << i << " local_meta->desc=" << local_meta->desc 
+                  << " remote_meta->desc=" << remote_meta->desc;
         
         struct fi_rma_iov rma_iov = {
             .addr = (uint64_t)remote_desc.addr,
@@ -658,6 +670,12 @@ nixl_status_t nixlOfiEngine::postXfer(const nixl_xfer_op_t &operation,
 
         // use unique context for each operation  
         uint64_t* op_context = new uint64_t(i);
+        
+        NIXL_INFO << "OFI transfer " << i << " calling fi_" << (operation == NIXL_READ ? "read" : "write")
+                  << " local_addr=0x" << std::hex << local_desc.addr 
+                  << " len=" << std::dec << local_desc.len
+                  << " remote_addr=0x" << std::hex << rma_iov.addr 
+                  << " remote_key=" << std::dec << rma_iov.key;
         
         switch (operation) {
             case NIXL_READ:
@@ -681,11 +699,29 @@ nixl_status_t nixlOfiEngine::postXfer(const nixl_xfer_op_t &operation,
                 return NIXL_ERR_NOT_SUPPORTED;
         }
 
+        NIXL_INFO << "OFI transfer " << i << " fi_" << (operation == NIXL_READ ? "read" : "write") << " returned: " << ret;
+        
         if (ret) {
             if (ret == -FI_EAGAIN) {
-                // RDM provider: FI_EAGAIN means operation was posted successfully
-                NIXL_DEBUG << "OFI transfer " << i << " posted asynchronously (EAGAIN)";
-                op_contexts.push_back(op_context);
+                // for verbs;ofi_rxm: FI_EAGAIN means retry needed, not successful posting
+                NIXL_INFO << "OFI transfer " << i << " got EAGAIN, driving progress via fi_cq_read and retrying";
+                delete op_context; // not posted, so cleanup
+                
+                // drive progress by reading completions (same logic as checkXfer)
+                struct fi_cq_entry comp;
+                ssize_t cq_ret = fi_cq_read(cq_, &comp, 1);
+                if (cq_ret < 0 && cq_ret != -FI_EAGAIN) {
+                    NIXL_ERROR << "Progress driving failed during EAGAIN retry: " << fi_strerror(-cq_ret);
+                    for (auto* ctx : op_contexts) {
+                        delete ctx;
+                    }
+                    delete ofi_req;
+                    return NIXL_ERR_BACKEND;
+                }
+                
+                // retry the operation after driving progress
+                i--; // retry this iteration
+                continue;
             } else {
                 NIXL_ERROR << "OFI transfer " << i << " failed: " << fi_strerror(-ret);
                 delete op_context;
@@ -850,6 +886,7 @@ nixl_status_t nixlOfiEngine::getPublicData(const nixlBackendMD* meta, std::strin
     // serialize memory registration key for remote access
     uint64_t mr_key = fi_mr_key(ofi_meta->mr);
     str = std::to_string(mr_key);
+    NIXL_INFO << "=== NIXL STATE: getPublicData mr_key=" << mr_key << " str=" << str << " ===";
     return NIXL_SUCCESS;
 }
 
@@ -875,16 +912,20 @@ nixl_status_t nixlOfiEngine::loadRemoteMD(const nixlBlobDesc &input, const nixl_
         uint64_t remote_key = std::stoull(key_str);
         
         // validate remote key before storing
-        if (remote_key == 0 || remote_key == UINT64_MAX) {
+        // TCP provider legitimately uses mr_key=0
+        if (remote_key == UINT64_MAX) {
             delete remote_meta;
             NIXL_ERROR << "Invalid remote memory key: " << remote_key;
             return NIXL_ERR_INVALID_PARAM;
         }
         
         // for remote metadata, we don't have an actual mr object, just the key
-        // store the key for later use in RMA operations - safe conversion
-        remote_meta->mr = nullptr;  // No local mr for remote metadata
+        // store the key safely in desc field for later extraction
+        remote_meta->mr = nullptr;
         remote_meta->desc = reinterpret_cast<void*>(static_cast<uintptr_t>(remote_key));
+        
+        NIXL_INFO << "=== NIXL STATE: loadRemoteMD agent=" << remote_agent << " remote_key=" << remote_key 
+                  << " stored_as_desc=0x" << std::hex << reinterpret_cast<uintptr_t>(remote_meta->desc) << std::dec << " ===";
         
         output = remote_meta;
         return NIXL_SUCCESS;
@@ -995,9 +1036,13 @@ nixl_status_t nixlOfiEngine::setupEndpoint(bool connection_oriented) {
     int ret = 0;
 
     // create endpoint
+    NIXL_INFO << "Creating endpoint: ep_type=" << fi_tostr(&fi_->ep_attr->type, FI_TYPE_EP_TYPE) 
+              << " connection_oriented=" << connection_oriented;
     ret = fi_endpoint(domain_, fi_, &ep_, nullptr);
     if (ret) {
         NIXL_ERROR << "fi_endpoint failed: " << fi_strerror(-ret);
+        NIXL_ERROR << "Domain: " << domain_ << " fi_info: " << fi_;
+        NIXL_ERROR << "EP attr type: " << fi_tostr(&fi_->ep_attr->type, FI_TYPE_EP_TYPE);
         return NIXL_ERR_BACKEND; // ep_ was never created, no cleanup needed
     }
 
