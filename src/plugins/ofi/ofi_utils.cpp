@@ -353,6 +353,67 @@ nixl_status_t createAndConfigureHints(OfiInitConfig& config) {
     return NIXL_SUCCESS;
 }
 
+// helper function to validate that the selected provider meets all requirements
+static void validateProviderCapabilities(const OfiInitConfig& config) {
+#define NIXL_CHECK_PROVIDER_ATTR(condition, attr_name, req_val, res_val, to_str_type) \
+    NIXL_ASSERT_ALWAYS(condition) \
+        << "Provider does not support requested " << attr_name << ". " \
+        << "Requested: " << fi_tostr(&(req_val), to_str_type) \
+        << ", Got: " << fi_tostr(&(res_val), to_str_type)
+
+    // caps
+    NIXL_CHECK_PROVIDER_ATTR((config.result->caps & config.hints->caps) == config.hints->caps,
+        "capabilities", config.hints->caps, config.result->caps, FI_TYPE_CAPS);
+
+    // modes
+    NIXL_CHECK_PROVIDER_ATTR((config.result->mode & config.hints->mode) == config.hints->mode,
+        "modes", config.hints->mode, config.result->mode, FI_TYPE_MODE);
+
+    // EP type
+    NIXL_CHECK_PROVIDER_ATTR(config.result->ep_attr->type == config.hints->ep_attr->type,
+        "endpoint type", config.hints->ep_attr->type, config.result->ep_attr->type, FI_TYPE_EP_TYPE);
+
+    // mr_mode
+    if (config.hints->domain_attr->mr_mode != 0) {
+        NIXL_CHECK_PROVIDER_ATTR((config.result->domain_attr->mr_mode & config.hints->domain_attr->mr_mode) == config.hints->domain_attr->mr_mode,
+            "mr_mode", config.hints->domain_attr->mr_mode, config.result->domain_attr->mr_mode, FI_TYPE_MR_MODE);
+    }
+
+    // threading model
+    if (config.hints->domain_attr->threading != FI_THREAD_UNSPEC) {
+        NIXL_CHECK_PROVIDER_ATTR(config.result->domain_attr->threading == config.hints->domain_attr->threading,
+            "threading model", config.hints->domain_attr->threading, config.result->domain_attr->threading, FI_TYPE_THREADING);
+    }
+
+    // resource management model
+    if (config.hints->domain_attr->resource_mgmt != FI_RM_UNSPEC) {
+        NIXL_ASSERT_ALWAYS(config.result->domain_attr->resource_mgmt == config.hints->domain_attr->resource_mgmt)
+            << "Provider does not support requested resource_mgmt. "
+            << "Requested: " << (config.hints->domain_attr->resource_mgmt == FI_RM_ENABLED ? "FI_RM_ENABLED" : "OTHER")
+            << ", Got: " << (config.result->domain_attr->resource_mgmt == FI_RM_ENABLED ? "FI_RM_ENABLED" : "OTHER");
+    }
+
+    // address format
+    if (config.hints->addr_format != FI_FORMAT_UNSPEC) {
+        NIXL_CHECK_PROVIDER_ATTR(config.result->addr_format == config.hints->addr_format,
+            "address format", config.hints->addr_format, config.result->addr_format, FI_TYPE_ADDR_FORMAT);
+    }
+
+    // tx op_flags
+    if (config.hints->tx_attr->op_flags != 0) {
+        NIXL_CHECK_PROVIDER_ATTR((config.result->tx_attr->op_flags & config.hints->tx_attr->op_flags) == config.hints->tx_attr->op_flags,
+            "tx_attr->op_flags", config.hints->tx_attr->op_flags, config.result->tx_attr->op_flags, FI_TYPE_OP_FLAGS);
+    }
+
+    // rx op_flags
+    if (config.hints->rx_attr->op_flags != 0) {
+        NIXL_CHECK_PROVIDER_ATTR((config.result->rx_attr->op_flags & config.hints->rx_attr->op_flags) == config.hints->rx_attr->op_flags,
+            "rx_attr->op_flags", config.hints->rx_attr->op_flags, config.result->rx_attr->op_flags, FI_TYPE_OP_FLAGS);
+    }
+
+#undef NIXL_CHECK_PROVIDER_ATTR
+}
+
 nixl_status_t performFiGetinfo(OfiInitConfig& config) {
     printf("=== NIXL OFI DEBUG: Before fi_getinfo ===\n");
     printf("FI_VERSION: 1.20\n");
@@ -394,6 +455,8 @@ nixl_status_t performFiGetinfo(OfiInitConfig& config) {
         return NIXL_ERR_BACKEND;
     }
 
+    validateProviderCapabilities(config);
+
     return NIXL_SUCCESS;
 }
 
@@ -410,14 +473,6 @@ nixl_status_t initializeOFI(OfiInitConfig& config) {
     status = performFiGetinfo(config);
     if (status != NIXL_SUCCESS) {
         return status;
-    }
-    
-    // debug: log negotiated tx/rx attributes after fi_getinfo
-    if (config.result && config.result->tx_attr && config.result->rx_attr) {
-        NIXL_INFO << "post-fi_getinfo tx_attr.size: " << config.result->tx_attr->size;
-        NIXL_INFO << "post-fi_getinfo tx_attr.op_flags: 0x" << std::hex << config.result->tx_attr->op_flags << std::dec;
-        NIXL_INFO << "post-fi_getinfo rx_attr.size: " << config.result->rx_attr->size;
-        NIXL_INFO << "post-fi_getinfo rx_attr.op_flags: 0x" << std::hex << config.result->rx_attr->op_flags << std::dec;
     }
     
     // step 3: sanitize capabilities based on actual provider support
