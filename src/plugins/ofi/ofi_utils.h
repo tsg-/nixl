@@ -57,4 +57,7 @@ nixl_status_t ofi_status_to_nixl(int ofi_status);
 // get common ofi backend options
 nixl_b_params_t get_ofi_backend_common_options();
 
+// helper function to get parameter values with defaults
+int get_param_int(const nixl_b_params_t& params, const std::string& key, int default_value);
+
 #endif

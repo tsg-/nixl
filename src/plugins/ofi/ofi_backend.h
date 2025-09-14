@@ -115,6 +115,10 @@ public:
     static std::unique_ptr<nixlOfiEngine>
     create(const nixlBackendInitParams &init_params);
 
+    // Plugin framework expects a constructor taking a pointer
+    explicit nixlOfiEngine(const nixlBackendInitParams *init_params_ptr)
+        : nixlOfiEngine(*init_params_ptr) {}
+
     ~nixlOfiEngine();
 
     bool
@@ -235,16 +239,22 @@ private:
 
 class nixlOfiBackendReqH : public nixlBackendReqH {
 public:
-    struct fi_context context;
-    fi_addr_t remote_fi_addr;
-    uint64_t remote_key;
-    void *remote_addr;
-    size_t transfer_size;
-    nixl_xfer_op_t operation;
-    bool completed;
+    struct fi_context context;    // must be zeroed before use
+    fi_addr_t remote_fi_addr;     // provider address of remote EP
+    uint64_t remote_key;          // remote MR key
+    void *remote_addr;            // remote buffer address
+    size_t transfer_size;         // size of transfer actually posted
+    nixl_xfer_op_t operation;     // NIXL_READ / NIXL_WRITE
+    bool completed;               // completion flag
 
-    nixlOfiBackendReqH() : nixlBackendReqH(), completed(false), remote_fi_addr(FI_ADDR_UNSPEC),
-                           remote_key(0), remote_addr(nullptr), transfer_size(0) {
+    nixlOfiBackendReqH()
+        : nixlBackendReqH(),
+          remote_fi_addr(FI_ADDR_UNSPEC),
+          remote_key(0),
+          remote_addr(nullptr),
+          transfer_size(0),
+          operation(NIXL_READ),
+          completed(false) {
         memset(&context, 0, sizeof(context));
     }
 

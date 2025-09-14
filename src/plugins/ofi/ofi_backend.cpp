@@ -23,6 +23,7 @@
 #include <limits>
 #include <string.h>
 #include <unistd.h>
+#include <cstring>
 
 std::unique_ptr<nixlOfiEngine>
 nixlOfiEngine::create(const nixlBackendInitParams &init_params) {
@@ -303,12 +304,12 @@ nixl_status_t nixlOfiEngine::prepXfer(const nixl_xfer_op_t &operation,
     }
 
     // validate descriptors - for simplicity, handle single descriptor for now
-    if (local.empty() || remote.empty()) {
+    if (local.isEmpty() || remote.isEmpty()) {
         NIXL_ERROR << "empty descriptor lists";
         return NIXL_ERR_INVALID_PARAM;
     }
 
-    if (local.size() != remote.size()) {
+    if (local.descCount() != remote.descCount()) {
         NIXL_ERROR << "local and remote descriptor count mismatch";
         return NIXL_ERR_INVALID_PARAM;
     }
@@ -319,22 +320,26 @@ nixl_status_t nixlOfiEngine::prepXfer(const nixl_xfer_op_t &operation,
     ofi_handle->remote_fi_addr = conn->getFiAddr();
 
     // get first descriptor pair (simplified - would need loop for multiple)
-    const auto &local_desc = local.front();
-    const auto &remote_desc = remote.front();
+    const auto &local_desc = *local.begin();
+    const auto &remote_desc = *remote.begin();
 
     // extract remote metadata (key + address)
-    if (remote_desc.md) {
+    if (remote_desc.metadataP) {
         // for remote metadata, we need to parse the public key string
         std::string key_str;
-        nixl_status_t status = getPublicData(remote_desc.md, key_str);
+        nixl_status_t status = getPublicData(remote_desc.metadataP, key_str);
         if (status != NIXL_SUCCESS) {
             return status;
         }
-        ofi_handle->remote_key = std::stoull(key_str);
+        try {
+            ofi_handle->remote_key = std::stoull(key_str);
+        } catch (const std::exception& e) {
+            NIXL_ERROR << "failed to parse remote memory key: " << key_str;
+            return NIXL_ERR_INVALID_PARAM;
+        }
     }
-
     ofi_handle->remote_addr = (void*)remote_desc.addr;
-    ofi_handle->transfer_size = std::min(local_desc.len, remote_desc.len);
+    ofi_handle->transfer_size = std::min(remote_desc.len, local_desc.len);
 
     NIXL_DEBUG << "prepared " << (operation == NIXL_READ ? "READ" : "WRITE")
                << " operation: size=" << ofi_handle->transfer_size
@@ -373,8 +378,8 @@ nixlOfiEngine::postXfer(const nixl_xfer_op_t &operation,
     }
 
     // get local descriptor info
-    const auto &local_desc = local.front();
-    const nixlOfiPrivateMetadata *local_md = static_cast<const nixlOfiPrivateMetadata*>(local_desc.md);
+    const auto &local_desc = *local.begin();
+    const nixlOfiPrivateMetadata *local_md = static_cast<const nixlOfiPrivateMetadata*>(local_desc.metadataP);
     if (!local_md) {
         NIXL_ERROR << "missing local metadata";
         return NIXL_ERR_INVALID_PARAM;
@@ -405,26 +410,41 @@ nixlOfiEngine::postXfer(const nixl_xfer_op_t &operation,
         return NIXL_ERR_INVALID_PARAM;
     }
 
-    // handle -FI_EAGAIN retry loop like server_bw.c
-    while (ret == -FI_EAGAIN) {
-        // check completion queue to make progress
+    // handle -FI_EAGAIN retry loop following LibFabric best practices
+    int retry_count = 0;
+    const auto &backend_params = getCustomParams();
+    const int max_retries = get_param_int(backend_params, "retry_count", 1000);
+    const int retry_delay_us = get_param_int(backend_params, "retry_delay_us", 1);
+
+    while (ret == -FI_EAGAIN && retry_count < max_retries) {
+        retry_count++;
+
+        // drive progress by attempting to read completions (doesn't matter if successful)
         struct fi_cq_err_entry comp;
-        int cq_ret = fi_cq_read(nixlOfiUtils::txcq, &comp, 1);
-        if (cq_ret >= 0 || cq_ret != -FI_EAGAIN) {
-            // made progress, retry the operation
-            switch (ofi_handle->operation) {
-            case NIXL_READ:
-                ret = fi_read(nixlOfiUtils::ep, local_addr, ofi_handle->transfer_size, mr_desc,
-                              ofi_handle->remote_fi_addr, (uint64_t)ofi_handle->remote_addr,
-                              ofi_handle->remote_key, &ofi_handle->context);
-                break;
-            case NIXL_WRITE:
-                ret = fi_write(nixlOfiUtils::ep, local_addr, ofi_handle->transfer_size, mr_desc,
-                               ofi_handle->remote_fi_addr, (uint64_t)ofi_handle->remote_addr,
-                               ofi_handle->remote_key, &ofi_handle->context);
-                break;
-            }
+        fi_cq_read(nixlOfiUtils::txcq, &comp, 1);  // ignore return value - just drive progress
+
+        // small delay to avoid busy waiting
+        usleep(retry_delay_us);
+
+        // retry the operation
+        switch (ofi_handle->operation) {
+        case NIXL_READ:
+            ret = fi_read(nixlOfiUtils::ep, local_addr, ofi_handle->transfer_size, mr_desc,
+                          ofi_handle->remote_fi_addr, (uint64_t)ofi_handle->remote_addr,
+                          ofi_handle->remote_key, &ofi_handle->context);
+            break;
+        case NIXL_WRITE:
+            ret = fi_write(nixlOfiUtils::ep, local_addr, ofi_handle->transfer_size, mr_desc,
+                           ofi_handle->remote_fi_addr, (uint64_t)ofi_handle->remote_addr,
+                           ofi_handle->remote_key, &ofi_handle->context);
+            break;
         }
+    }
+
+    // if we exhausted retries, treat as temporary failure
+    if (ret == -FI_EAGAIN && retry_count >= max_retries) {
+        NIXL_WARN << "operation failed to post after " << max_retries << " retries";
+        return NIXL_IN_PROG;  // caller can retry later
     }
 
     if (ret) {

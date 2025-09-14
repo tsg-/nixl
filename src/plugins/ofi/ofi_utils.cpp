@@ -110,8 +110,7 @@ nixl_status_t nixlOfiUtils::setupFabric(const nixl_b_params_t& params) {
     struct fi_cq_attr cq_attr = {0};
 
     // get tx cq size from params
-    auto tx_cq_it = params.find("tx_cq_size");
-    cq_attr.size = (tx_cq_it != params.end()) ? std::stoul(tx_cq_it->second) : 1024;
+    cq_attr.size = get_param_int(params, "tx_cq_size", 1024);
 
     ret = fi_cq_open(domain, &cq_attr, &txcq, nullptr);
     if (ret) {
@@ -120,8 +119,7 @@ nixl_status_t nixlOfiUtils::setupFabric(const nixl_b_params_t& params) {
     }
 
     // get rx cq size from params
-    auto rx_cq_it = params.find("rx_cq_size");
-    cq_attr.size = (rx_cq_it != params.end()) ? std::stoul(rx_cq_it->second) : 1024;
+    cq_attr.size = get_param_int(params, "rx_cq_size", 1024);
 
     ret = fi_cq_open(domain, &cq_attr, &rxcq, nullptr);
     if (ret) {
@@ -249,12 +247,11 @@ nixl_b_params_t get_ofi_backend_common_options() {
         {"ofi_domain", ""},                 // domain selection
         {"num_workers", "1"},               // number of worker threads
         {"tx_cq_size", "1024"},             // transmit completion queue size
-        {"rx_cq_size", "1024"}              // receive completion queue size
+        {"rx_cq_size", "1024"},             // receive completion queue size
+        {"retry_count", "1000"},            // max retries for -FI_EAGAIN operations
+        {"retry_delay_us", "1"}             // delay in microseconds between retries
     };
     return params;
-<<<<<<< Updated upstream
-}
-=======
 }
 
 int get_param_int(const nixl_b_params_t& params, const std::string& key, int default_value) {
@@ -269,4 +266,3 @@ int get_param_int(const nixl_b_params_t& params, const std::string& key, int def
     }
     return default_value;
 }
->>>>>>> Stashed changes
