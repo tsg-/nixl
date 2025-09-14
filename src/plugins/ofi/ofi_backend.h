@@ -49,15 +49,41 @@ using ofi_connection_ptr_t = std::shared_ptr<nixlOfiConnection>;
 
 class nixlOfiPrivateMetadata : public nixlBackendMD {
     private:
-        // placeholder for ofi memory registration
         nixl_blob_t keyStr;
+        struct fid_mr *mr;
+        void *mr_desc;
+        uint64_t mr_key;
+        void *addr;
+        size_t length;
+        nixl_mem_t mem_type;
 
     public:
-        nixlOfiPrivateMetadata() : nixlBackendMD(true) {
+        nixlOfiPrivateMetadata() : nixlBackendMD(true), mr(nullptr), mr_desc(nullptr),
+                                   mr_key(0), addr(nullptr), length(0), mem_type(DRAM_SEG) {
         }
 
         [[nodiscard]] const std::string& get() const noexcept {
             return keyStr;
+        }
+
+        [[nodiscard]] struct fid_mr* getMr() const noexcept {
+            return mr;
+        }
+
+        [[nodiscard]] void* getMrDesc() const noexcept {
+            return mr_desc;
+        }
+
+        [[nodiscard]] uint64_t getMrKey() const noexcept {
+            return mr_key;
+        }
+
+        [[nodiscard]] void* getAddr() const noexcept {
+            return addr;
+        }
+
+        [[nodiscard]] size_t getLength() const noexcept {
+            return length;
         }
 
     friend class nixlOfiEngine;
