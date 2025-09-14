@@ -26,101 +26,50 @@
 #include <rdma/fi_domain.h>
 #include <rdma/fi_endpoint.h>
 #include <rdma/fi_cm.h>
-#include <rdma/fi_eq.h>
-#include <rdma/fi_ext.h>
-
-#include <dlfcn.h>
-#include "habanalabs/synapse_api.h"
+#include <rdma/fi_rma.h>
 
 #include <string>
 #include <map>
 #include <mutex>
-#include <thread>
-#include <atomic>
-#include <condition_variable>
+#include <vector>
 #include <memory>
+#include <atomic>
+#include <array>
+#include <set>
+#include <chrono>
 
 class nixlOfiMetadata : public nixlBackendMD {
 public:
     fid_mr *mr;
     void *desc;
+    uint64_t remote_key;  // Store the remote key for cross-agent access
 
-    nixlOfiMetadata() : nixlBackendMD(false), mr(nullptr), desc(nullptr) { }
-    ~nixlOfiMetadata() { }
+    nixlOfiMetadata() : nixlBackendMD(false), mr(nullptr), desc(nullptr), remote_key(0) {}
+    ~nixlOfiMetadata() {}
 };
 
 class nixlOfiRequest : public nixlBackendReqH {
 public:
     size_t total_operations;
-    size_t completed_operations;
-    bool is_prepared;
-    bool is_posted;
-    
-    // completion tracking
-    fid_cq *cq;
-    std::atomic<uint64_t> wr_id;
-    
-    // operation contexts for cleanup
-    std::vector<std::unique_ptr<uint64_t>> op_contexts;
-    
-    // transfer parameters for delayed execution
-    nixl_xfer_op_t operation;
-    std::vector<nixlMetaDesc> local_descs;
-    std::vector<nixlMetaDesc> remote_descs;
-    std::string remote_agent;
-    
-    nixlOfiRequest() : total_operations(0), completed_operations(0), 
-                       is_prepared(false), is_posted(false), cq(nullptr), wr_id(0) { }
-    
-    ~nixlOfiRequest() {
-        // auto cleanup via unique_ptr
-    }
-    
-    // helper methods
+    std::atomic<size_t> completed_operations;
+
+    nixlOfiRequest(size_t total_ops) : total_operations(total_ops), completed_operations(0) {}
+    ~nixlOfiRequest() {}
+
     bool isComplete() const { return completed_operations >= total_operations; }
-    size_t remainingOperations() const { return total_operations - completed_operations; }
-    
-private:
-    // disable copy
-    nixlOfiRequest(const nixlOfiRequest&) = delete;
-    nixlOfiRequest& operator=(const nixlOfiRequest&) = delete;
-};
-
-class nixlOfiHmemManager {
-public:
-    nixlOfiHmemManager();
-    ~nixlOfiHmemManager();
-    
-    void initializeHmemCapabilities();
-    void detectProviderCapabilities(struct fi_info* fi_info, const std::string& provider_name);
-    fi_hmem_iface selectHmemInterface(const nixlBlobDesc &mem, uint64_t &device_id) const;
-    
-    nixl_status_t registerVramMemory(const nixlBlobDesc &mem, nixlOfiMetadata *ofi_meta, 
-                                     const struct fi_info* fi_info, fid_domain *domain) const;
-    nixl_status_t registerSynapseAIMemoryExplicit(const nixlBlobDesc &mem, nixlOfiMetadata *ofi_meta,
-                                                  const struct fi_info* fi_info, fid_domain *domain) const;
-    
-    bool isZeSupported() const { return hmemZeSupported_; }
-    bool isCudaSupported() const { return hmemCudaSupported_; }
-    bool isSynapseaiSupported() const { return hmemSynapseaiSupported_; }
-
-private:
-    bool hmemZeSupported_;
-    bool hmemCudaSupported_;
-    bool hmemSynapseaiSupported_;
 };
 
 class nixlOfiEngine : public nixlBackendEngine {
 public:
-    // constructors and destructor
     nixlOfiEngine(const nixlBackendInitParams* init_params);
     ~nixlOfiEngine();
 
-    // member functions
-    bool supportsNotif() const override;
-    bool supportsRemote() const override;
-    bool supportsLocal() const override;
-    bool supportsProgTh() const override;
+    bool supportsNotif() const override { return true; }
+    bool supportsRemote() const override { return true; }
+        // Guard to prevent use-after-close during destruction (getNotifs may be called late)
+        std::atomic<bool> shutting_down_{false};
+    bool supportsLocal() const override { return true; }
+    bool supportsProgTh() const override { return true; }
 
     nixl_mem_list_t getSupportedMems() const override;
 
@@ -145,86 +94,80 @@ public:
                           const std::string &remote_agent,
                           nixlBackendReqH* &handle,
                           const nixl_opt_b_args_t* opt_args=nullptr) const override;
-                          
-    nixl_status_t postPreparedXfer(nixlOfiRequest* ofi_req) const;
 
     nixl_status_t checkXfer(nixlBackendReqH* handle) const override;
     nixl_status_t releaseReqH(nixlBackendReqH* handle) const override;
 
     nixl_status_t getConnInfo(std::string &conn_info) const override;
     nixl_status_t loadRemoteConnInfo(const std::string &remote_agent, const std::string &conn_info) override;
-    
+
     nixl_status_t getPublicData(const nixlBackendMD* meta, std::string &str) const override;
-    nixl_status_t loadRemoteMD(const nixlBlobDesc &input, const nixl_mem_t &nixl_mem, 
+    nixl_status_t loadRemoteMD(const nixlBlobDesc &input, const nixl_mem_t &nixl_mem,
                                const std::string &remote_agent, nixlBackendMD* &output) override;
 
-    // Notification methods (required when supportsNotif() = true)
-    nixl_status_t getNotifs(notif_list_t &notif_list) override;
-    nixl_status_t genNotif(const std::string &remote_agent, const std::string &msg) const override;
+    // local operations support
+    nixl_status_t loadLocalMD(nixlBackendMD* input, nixlBackendMD* &output) override;
 
+    // Notification support
+    nixl_status_t getNotifs(notif_list_t &notif_list) override;
+
+    // Ensure endpoint enabled (late enable path). Safe to call multiple times.
+    nixl_status_t ensureEndpointEnabled();
 
 private:
-    // type definitions and nested classes
-
-    // member functions
-    void eqEventLoop();
-    
-    nixl_status_t setupEndpoint(bool connection_oriented);
-    static nixl_status_t getEndpointAddress(fid_ep* endpoint, std::string& address);
-    
-    // parameter helpers
-    void getStringParam(const nixlBackendInitParams* init_params, const std::string& key, std::string& value);
-    void getLongParam(const nixlBackendInitParams* init_params, const std::string& key, long& value, long min_val, long max_val);
-    void getSizeTParam(const nixlBackendInitParams* init_params, const std::string& key, size_t& value);
-    
-    // connection helpers
-    nixl_status_t connectUnlocked(const std::string &remote_agent);
-    
-    // Memory registration helpers
-    nixl_status_t registerDramMemory(const nixlBlobDesc &mem, nixlOfiMetadata *ofi_meta) const;
-    nixl_status_t registerVramMemory(const nixlBlobDesc &mem, nixlOfiMetadata *ofi_meta) const;
-    nixl_status_t registerSynapseAIMemoryExplicit(const nixlBlobDesc &mem, nixlOfiMetadata *ofi_meta) const;
-
-    // helper methods
-    nixl_status_t handleCQError(fid_cq* cq, int error_ret) const;
-    nixl_status_t driveProgress() const;  // reusable progress driving for FI_EAGAIN retry
-    uint64_t getRemoteKey(nixlOfiMetadata* remote_meta) const;
-    bool isConnectionEstablished(const std::string& remote_agent) const;
-    nixl_status_t validateTransferParams(const nixlMetaDesc& local_desc, const nixlMetaDesc& remote_desc) const;
-    
-
-    // data members
     fid_fabric *fabric_;
     fid_domain *domain_;
     fid_ep *ep_;
-    fid_cq *cq_;
-    fid_cntr *txcntr_;
-    fid_cntr *rxcntr_;
-    fid_cntr *rma_cntr_;
-    fid_eq *eq_;
-    fid_pep *pep_;
+    fid_cq *txcq_;
+    fid_cq *rxcq_;
+    fid_av *av_;
     struct fi_info *fi_;
-    struct fi_info *hints_;
-    
-    std::string providerName_;
-    struct fi_info *cachedProviderInfo_;
+    bool ep_ready_ = false;
+    bool delayed_enable_mode_ = false; // if true we delay fi_enable until after AV insert
+    bool ep_enabled_once_ = false;     // track if enable has been performed
+    mutable std::mutex enableLock_;    // guard late enable sequence
+    bool disable_local_sentinel_ = false; // when true we never emit/accept LOCAL sentinel (forces real address exchange)
+    bool timing_enabled_ = false; // enabled via NIXL_OFI_TIMING env var
+    std::chrono::steady_clock::time_point start_time_;
+    mutable std::mutex trace_lock_;
+    mutable std::set<std::string> traced_stages_; // ensure each stage only logged once
+
+    // first-time lifecycle flags
+    std::atomic<bool> first_handshake_started_{false};
+    std::atomic<bool> first_handshake_completed_{false};
+    std::atomic<bool> first_rma_post_attempt_{false};
+    std::atomic<bool> first_rma_post_success_{false};
+    std::atomic<bool> first_rma_post_eagain_{false};
+    std::atomic<bool> first_rma_completion_{false};
+
     std::string localAddr_;
     mutable std::map<std::string, std::string> remoteAddrs_;
-    mutable std::map<std::string, fid_ep *> connectedEps_;
     mutable std::map<std::string, fi_addr_t> avAddrs_;
-    fid_av *av_;
-    mutable std::mutex epLock_;
-    bool isConnectionless_;
+    mutable std::mutex avLock_;
 
-    std::thread eqThread_;
-    std::atomic<bool> eqThreadStop_;
-    std::atomic<bool> eqThreadPaused_;
-    std::mutex eqPauseMutex_;
-    std::condition_variable eqPauseCV_;
-    long eqTimeoutMs_;
-    std::string localAgentName_;
-    
-    std::unique_ptr<nixlOfiHmemManager> hmemManager_;
+    // Handshake support
+    static constexpr size_t WAKEUP_MSG_SIZE = 1;
+    static constexpr uint64_t recv_context_ = 0xDEADBEEF;
+    mutable std::array<uint8_t, WAKEUP_MSG_SIZE> persistent_recv_buf_;
+    mutable std::set<std::string> handshake_completed_;
+
+    // utility to decode and print address info
+    void logAddressInfo(const std::string& prefix, const void* addr_data, size_t addr_len, int addr_format = -1) const;
+
+    // Handshake methods
+    nixl_status_t postPersistentRecv() const;
+    nixl_status_t performHandshake(const std::string &remote_agent, fi_addr_t remote_addr) const;
+
+    // instrumentation counters
+    mutable std::atomic<uint64_t> rma_posted_{0};
+    mutable std::atomic<uint64_t> rma_completed_{0};
+    mutable std::atomic<uint64_t> rma_eagain_{0};
+        void logRmaStats(const char* tag) const;
+         // helper to read and log any cq error entries when persistent -FI_EAGAIN occurs
+        void dumpCQErrors(struct fid_cq* cq, const char* which) const;
+
+    // tracing helper (idempotent per stage)
+    void traceStage(const std::string &stage, const std::string &detail = "") const;
 };
 
 #endif

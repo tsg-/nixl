@@ -23,7 +23,7 @@ namespace
 {
     static const char *PLUGIN_NAME = "OFI";
     static const char *PLUGIN_VERSION = "0.1.0";
-    
+
     // create a new OFI backend engine instance
     static nixlBackendEngine *
     create_ofi_engine (const nixlBackendInitParams *init_params) {
@@ -37,7 +37,7 @@ namespace
             return nullptr;
         }
     }
-    
+
     static void
     destroy_ofi_engine (nixlBackendEngine *engine) {
         delete engine;
@@ -47,12 +47,12 @@ namespace
     get_plugin_name() {
         return PLUGIN_NAME;
     }
-    
+
     static const char *
     get_plugin_version() {
         return PLUGIN_VERSION;
     }
-    
+
     static nixl_b_params_t
     get_backend_options() {
         nixl_b_params_t params;
@@ -60,12 +60,11 @@ namespace
         params["eq_timeout_ms"] = "100";
         return params;
     }
-    
+
     static nixl_mem_list_t
     get_backend_mems() {
         nixl_mem_list_t mems;
         mems.push_back (DRAM_SEG);
-        mems.push_back (VRAM_SEG);
         return mems;
     }
 

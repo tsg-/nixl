@@ -266,10 +266,13 @@ nixlAgent::createBackend(const nixl_backend_t &type,
     std::string           str;
     backend_list_t*       backend_list;
 
+    NIXL_INFO << "TRACE: createBackend called for type: " << type;
     NIXL_LOCK_GUARD(data->lock);
     // Registering same type of backend is not supported, unlikely and prob error
-    if (data->backendEngines.count(type)!=0)
+    if (data->backendEngines.count(type)!=0) {
+        NIXL_INFO << "TRACE: backend type " << type << " already exists, returning NIXL_ERR_INVALID_PARAM";
         return NIXL_ERR_INVALID_PARAM;
+    }
 
     // Check if the plugin is in an illegal combination with another plugin backend already created
     for (const auto &combination : illegal_plugin_combinations) {
@@ -279,6 +282,7 @@ nixlAgent::createBackend(const nixl_backend_t &type,
                     data->backendEngines.find(plugin_name) != data->backendEngines.end()) {
                     NIXL_ERROR << "Plugin backend " << type << " is in illegal combination with "
                                << plugin_name;
+                    NIXL_INFO << "TRACE: returning NIXL_ERR_NOT_ALLOWED due to illegal combination";
                     return NIXL_ERR_NOT_ALLOWED;
                 }
             }
@@ -293,53 +297,73 @@ nixlAgent::createBackend(const nixl_backend_t &type,
     init_params.syncMode = data->config.syncMode;
     init_params.enableTelemetry_ = data->telemetry_ != nullptr;
 
+    NIXL_INFO << "TRACE: trying to load plugin: " << type;
     // First, try to load the backend as a plugin
     auto& plugin_manager = nixlPluginManager::getInstance();
     auto plugin_handle = plugin_manager.loadPlugin(type);
 
     if (plugin_handle) {
+        NIXL_INFO << "TRACE: plugin loaded successfully, creating engine";
         // Plugin found, use it to create the backend
         backend = plugin_handle->createEngine(&init_params);
     } else {
         NIXL_ERROR << "Unsupported backend: " << type;
+        NIXL_INFO << "TRACE: plugin not found, returning NIXL_ERR_NOT_FOUND";
         return NIXL_ERR_NOT_FOUND;
     }
 
     if (backend) {
+        NIXL_INFO << "TRACE: backend created, checking getInitErr()";
         if (backend->getInitErr()) {
+            NIXL_INFO << "TRACE: backend->getInitErr() returned true, deleting backend and returning NIXL_ERR_BACKEND";
             delete backend;
             return NIXL_ERR_BACKEND;
         }
 
+        NIXL_INFO << "TRACE: backend init OK, checking if supportsRemote()";
         if (backend->supportsRemote()) {
+            NIXL_INFO << "TRACE: backend supports remote, checking supportsNotif()";
             if (!backend->supportsNotif()) {
+                NIXL_INFO << "TRACE: backend does not support notifications, deleting backend and returning NIXL_ERR_BACKEND";
                 delete backend;
                 return NIXL_ERR_BACKEND;
             }
 
+            NIXL_INFO << "TRACE: backend supports notifications, getting connection info";
             ret = backend->getConnInfo(str);
             if (ret != NIXL_SUCCESS) {
+                NIXL_INFO << "TRACE: getConnInfo failed with ret=" << ret << ", deleting backend";
                 delete backend;
                 return ret;
             }
+            NIXL_INFO << "TRACE: getConnInfo succeeded";
             data->connMD[type] = str;
         }
 
+        NIXL_INFO << "TRACE: checking if backend supportsLocal()";
         if (backend->supportsLocal()) {
+            NIXL_INFO << "TRACE: backend supports local, calling connect()";
             ret = backend->connect(data->name);
 
             if (NIXL_SUCCESS != ret) {
+                NIXL_INFO << "TRACE: backend->connect() failed with ret=" << ret << ", deleting backend";
                 delete backend;
                 return ret;
             }
+            NIXL_INFO << "TRACE: backend->connect() succeeded";
+        } else {
+            NIXL_INFO << "TRACE: backend does not support local operations";
         }
 
+        NIXL_INFO << "TRACE: creating backend handle";
         bknd_hndl = new nixlBackendH(backend);
         if (!bknd_hndl) {
+            NIXL_INFO << "TRACE: failed to create backend handle, returning NIXL_ERR_BACKEND";
             delete backend;
             return NIXL_ERR_BACKEND;
         }
 
+        NIXL_INFO << "TRACE: storing backend in data structures";
         data->backendEngines[type] = backend;
         data->backendHandles[type] = bknd_hndl;
         mems = backend->getSupportedMems();
@@ -357,8 +381,11 @@ nixlAgent::createBackend(const nixl_backend_t &type,
         //       when threading is in agent
 
         NIXL_DEBUG << "Created backend: " << type;
+        NIXL_INFO << "TRACE: createBackend completed successfully for type: " << type;
 
         return NIXL_SUCCESS;
+    } else {
+        NIXL_INFO << "TRACE: backend is null after createEngine(), returning NIXL_ERR_BACKEND";
     }
 
     return NIXL_ERR_BACKEND;
@@ -1323,6 +1350,7 @@ nixlAgent::loadRemoteMD (const nixl_blob_t &remote_metadata,
 
     std::string remote_agent = sd.getStr("Agent");
     if (remote_agent.empty()) {
+        NIXL_ERROR << "loadRemoteMD: missing 'Agent' field in remote metadata (empty string)";
         return NIXL_ERR_MISMATCH;
     }
 
@@ -1343,11 +1371,13 @@ nixlAgent::loadRemoteMD (const nixl_blob_t &remote_metadata,
     for (size_t i = 0; i < conn_cnt; ++i) {
         nixl_backend = sd.getStr("t");
         if (nixl_backend.empty()) {
+            NIXL_ERROR << "loadRemoteMD: empty backend type string 't' at index " << i;
             return NIXL_ERR_MISMATCH;
         }
 
         conn_info = sd.getStr("c");
         if (conn_info.empty()) {
+            NIXL_ERROR << "loadRemoteMD: empty connection info 'c' for backend '" << nixl_backend << "' at index " << i;
             return NIXL_ERR_MISMATCH;
         }
 
@@ -1386,6 +1416,7 @@ nixlAgent::loadRemoteMD (const nixl_blob_t &remote_metadata,
     }
 
     if (sd.getStr("") != "MemSection") {
+        NIXL_ERROR << "loadRemoteMD: missing or incorrect MemSection marker (expected 'MemSection')";
         return NIXL_ERR_MISMATCH;
     }
 

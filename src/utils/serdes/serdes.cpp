@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 #include "serdes.h"
+#include "common/nixl_log.h"
 
 nixlSerDes::nixlSerDes() {
     workingStr = "nixlSerDes|";
@@ -34,6 +35,10 @@ void nixlSerDes::_stringToBytes(void* fill_buf, const std::string &s, ssize_t si
 
 // Strings serialization
 nixl_status_t nixlSerDes::addStr(const std::string &tag, const std::string &str){
+    size_t preview_len = std::min<size_t>(str.size(), 48);
+    std::string preview = str.substr(0, preview_len);
+    if (str.size() > preview_len) preview += "...";
+    NIXL_DEBUG << "SerDes:addStr tag='" << tag << "' len=" << str.size() << " preview='" << preview << "'";
 
     size_t len = str.size();
 
@@ -47,10 +52,10 @@ nixl_status_t nixlSerDes::addStr(const std::string &tag, const std::string &str)
 
 std::string nixlSerDes::getStr(const std::string &tag){
 
-    if(workingStr.compare(des_offset, tag.size(), tag) != 0){
-       //incorrect tag
-       return "";
-    }
+     if(workingStr.compare(des_offset, tag.size(), tag) != 0){
+         NIXL_DEBUG << "SerDes:getStr mismatch expected tag='" << tag << "' at offset=" << des_offset;
+         return "";
+     }
     ssize_t len;
 
     //skip tag
@@ -67,6 +72,10 @@ std::string nixlSerDes::getStr(const std::string &tag){
     //move past string plus | delimiter
     des_offset += len + 1;
 
+    size_t preview_len = std::min<size_t>(ret.size(), 48);
+    std::string preview = ret.substr(0, preview_len);
+    if (ret.size() > preview_len) preview += "...";
+    NIXL_DEBUG << "SerDes:getStr tag='" << tag << "' len=" << ret.size() << " preview='" << preview << "'";
     return ret;
 }
 
