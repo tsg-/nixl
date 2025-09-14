@@ -18,18 +18,37 @@
 #define NIXL_SRC_PLUGINS_OFI_OFI_UTILS_H
 
 #include "nixl_types.h"
+#include <rdma/fabric.h>
+#include <rdma/fi_domain.h>
+#include <rdma/fi_endpoint.h>
+#include <rdma/fi_rma.h>
+#include <rdma/fi_errno.h>
+#include <rdma/fi_cm.h>
 
-// placeholder ofi utility functions and classes
+// ofi utility functions and classes
 
 class nixlOfiUtils {
 public:
-    // placeholder utility methods
+    // ofi initialization methods
     static nixl_status_t initOfi();
     static void cleanupOfi();
 
-    // placeholder for fabric discovery and setup
-    static nixl_status_t setupFabric();
+    // fabric discovery and setup
+    static nixl_status_t setupFabric(const nixl_b_params_t& params);
     static nixl_status_t cleanupFabric();
+
+    // fabric resources
+    static struct fi_info *hints;
+    static struct fi_info *fi;
+    static struct fid_fabric *fabric;
+    static struct fid_domain *domain;
+    static struct fid_ep *ep;
+    static struct fid_cq *txcq;
+    static struct fid_cq *rxcq;
+    static struct fid_av *av;
+
+private:
+    static bool fabric_initialized;
 };
 
 // placeholder for ofi status conversion

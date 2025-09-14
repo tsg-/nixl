@@ -17,27 +17,216 @@
 
 #include "ofi_utils.h"
 #include "common/nixl_log.h"
+#include <cstring>
+
+// static member definitions
+struct fi_info *nixlOfiUtils::hints = nullptr;
+struct fi_info *nixlOfiUtils::fi = nullptr;
+struct fid_fabric *nixlOfiUtils::fabric = nullptr;
+struct fid_domain *nixlOfiUtils::domain = nullptr;
+struct fid_ep *nixlOfiUtils::ep = nullptr;
+struct fid_cq *nixlOfiUtils::txcq = nullptr;
+struct fid_cq *nixlOfiUtils::rxcq = nullptr;
+struct fid_av *nixlOfiUtils::av = nullptr;
+bool nixlOfiUtils::fabric_initialized = false;
 
 nixl_status_t nixlOfiUtils::initOfi() {
-    // placeholder ofi initialization
     NIXL_INFO << "initializing ofi utilities";
     return NIXL_SUCCESS;
 }
 
 void nixlOfiUtils::cleanupOfi() {
-    // placeholder ofi cleanup
     NIXL_INFO << "cleaning up ofi utilities";
+    cleanupFabric();
 }
 
-nixl_status_t nixlOfiUtils::setupFabric() {
-    // placeholder fabric setup
+nixl_status_t nixlOfiUtils::setupFabric(const nixl_b_params_t& params) {
+    if (fabric_initialized) {
+        NIXL_INFO << "fabric already initialized";
+        return NIXL_SUCCESS;
+    }
+
     NIXL_INFO << "setting up ofi fabric";
+    int ret;
+
+    // configure hints
+    hints = fi_allocinfo();
+    if (!hints) {
+        NIXL_ERROR << "failed to allocate fi_info";
+        return NIXL_ERR_BACKEND;
+    }
+
+    hints->caps = FI_MSG | FI_RMA | FI_READ | FI_WRITE | FI_REMOTE_READ | FI_REMOTE_WRITE;
+    hints->mode = FI_CONTEXT;
+    hints->addr_format = FI_FORMAT_UNSPEC;
+    hints->ep_attr->type = FI_EP_RDM;
+    hints->domain_attr->threading = FI_THREAD_DOMAIN;
+    hints->domain_attr->control_progress = FI_PROGRESS_UNSPEC;
+    hints->domain_attr->data_progress = FI_PROGRESS_UNSPEC;
+    hints->domain_attr->resource_mgmt = FI_RM_ENABLED;
+    hints->domain_attr->mr_mode = FI_MR_LOCAL | FI_MR_RAW | FI_MR_VIRT_ADDR |
+                                  FI_MR_ALLOCATED | FI_MR_PROV_KEY | FI_MR_ENDPOINT;
+
+    // set provider from params
+    auto provider_it = params.find("ofi_provider");
+    if (provider_it != params.end() && !provider_it->second.empty()) {
+        hints->fabric_attr->prov_name = strdup(provider_it->second.c_str());
+    }
+
+    // get fabric info
+    uint64_t flags = FI_SOURCE;
+    ret = fi_getinfo(FI_VERSION(1, 20), nullptr, nullptr, flags, hints, &fi);
+    if (ret) {
+        NIXL_ERROR << "fi_getinfo failed: " << fi_strerror(-ret);
+        fi_freeinfo(hints);
+        hints = nullptr;
+        return NIXL_ERR_BACKEND;
+    }
+
+    NIXL_INFO << "using provider: " << fi->fabric_attr->prov_name;
+
+    // create fabric
+    ret = fi_fabric(fi->fabric_attr, &fabric, nullptr);
+    if (ret) {
+        NIXL_ERROR << "fi_fabric failed: " << fi_strerror(-ret);
+        return NIXL_ERR_BACKEND;
+    }
+
+    // create domain
+    ret = fi_domain(fabric, fi, &domain, nullptr);
+    if (ret) {
+        NIXL_ERROR << "fi_domain failed: " << fi_strerror(-ret);
+        return NIXL_ERR_BACKEND;
+    }
+
+    // create endpoint
+    ret = fi_endpoint(domain, fi, &ep, nullptr);
+    if (ret) {
+        NIXL_ERROR << "fi_endpoint failed: " << fi_strerror(-ret);
+        return NIXL_ERR_BACKEND;
+    }
+
+    // create completion queues
+    struct fi_cq_attr cq_attr = {0};
+
+    // get tx cq size from params
+    auto tx_cq_it = params.find("tx_cq_size");
+    cq_attr.size = (tx_cq_it != params.end()) ? std::stoul(tx_cq_it->second) : 1024;
+
+    ret = fi_cq_open(domain, &cq_attr, &txcq, nullptr);
+    if (ret) {
+        NIXL_ERROR << "fi_cq_open for tx failed: " << fi_strerror(-ret);
+        return NIXL_ERR_BACKEND;
+    }
+
+    // get rx cq size from params
+    auto rx_cq_it = params.find("rx_cq_size");
+    cq_attr.size = (rx_cq_it != params.end()) ? std::stoul(rx_cq_it->second) : 1024;
+
+    ret = fi_cq_open(domain, &cq_attr, &rxcq, nullptr);
+    if (ret) {
+        NIXL_ERROR << "fi_cq_open for rx failed: " << fi_strerror(-ret);
+        return NIXL_ERR_BACKEND;
+    }
+
+    // create address vector (initialize with default constructor then set fields explicitly)
+    struct fi_av_attr av_attr = {};
+    av_attr.type = FI_AV_TABLE; // use table-based address vector for simplicity
+    av_attr.count = 1;          // initial capacity (libfabric may resize internally)
+    ret = fi_av_open(domain, &av_attr, &av, nullptr);
+    if (ret) {
+        NIXL_ERROR << "fi_av_open failed: " << fi_strerror(-ret);
+        return NIXL_ERR_BACKEND;
+    }
+
+    // bind resources to endpoint
+    ret = fi_ep_bind(ep, &av->fid, 0);
+    if (ret) {
+        NIXL_ERROR << "fi_ep_bind av failed: " << fi_strerror(-ret);
+        return NIXL_ERR_BACKEND;
+    }
+
+    ret = fi_ep_bind(ep, &txcq->fid, FI_TRANSMIT);
+    if (ret) {
+        NIXL_ERROR << "fi_ep_bind txcq failed: " << fi_strerror(-ret);
+        return NIXL_ERR_BACKEND;
+    }
+
+    ret = fi_ep_bind(ep, &rxcq->fid, FI_RECV);
+    if (ret) {
+        NIXL_ERROR << "fi_ep_bind rxcq failed: " << fi_strerror(-ret);
+        return NIXL_ERR_BACKEND;
+    }
+
+    // enable endpoint
+    ret = fi_enable(ep);
+    if (ret) {
+        NIXL_ERROR << "fi_enable failed: " << fi_strerror(-ret);
+        return NIXL_ERR_BACKEND;
+    }
+
+    fabric_initialized = true;
+    NIXL_INFO << "ofi fabric setup complete";
     return NIXL_SUCCESS;
 }
 
 nixl_status_t nixlOfiUtils::cleanupFabric() {
-    // placeholder fabric cleanup
+    if (!fabric_initialized) {
+        return NIXL_SUCCESS;
+    }
+
     NIXL_INFO << "cleaning up ofi fabric";
+    int ret;
+
+    // close resources in reverse order
+    if (ep) {
+        ret = fi_close(&ep->fid);
+        if (ret) NIXL_WARN << "error closing endpoint: " << fi_strerror(-ret);
+        ep = nullptr;
+    }
+
+    if (av) {
+        ret = fi_close(&av->fid);
+        if (ret) NIXL_WARN << "error closing av: " << fi_strerror(-ret);
+        av = nullptr;
+    }
+
+    if (rxcq) {
+        ret = fi_close(&rxcq->fid);
+        if (ret) NIXL_WARN << "error closing rxcq: " << fi_strerror(-ret);
+        rxcq = nullptr;
+    }
+
+    if (txcq) {
+        ret = fi_close(&txcq->fid);
+        if (ret) NIXL_WARN << "error closing txcq: " << fi_strerror(-ret);
+        txcq = nullptr;
+    }
+
+    if (domain) {
+        ret = fi_close(&domain->fid);
+        if (ret) NIXL_WARN << "error closing domain: " << fi_strerror(-ret);
+        domain = nullptr;
+    }
+
+    if (fabric) {
+        ret = fi_close(&fabric->fid);
+        if (ret) NIXL_WARN << "error closing fabric: " << fi_strerror(-ret);
+        fabric = nullptr;
+    }
+
+    if (fi) {
+        fi_freeinfo(fi);
+        fi = nullptr;
+    }
+
+    if (hints) {
+        fi_freeinfo(hints);
+        hints = nullptr;
+    }
+
+    fabric_initialized = false;
+    NIXL_INFO << "ofi fabric cleanup complete";
     return NIXL_SUCCESS;
 }
 
@@ -63,4 +252,21 @@ nixl_b_params_t get_ofi_backend_common_options() {
         {"rx_cq_size", "1024"}              // receive completion queue size
     };
     return params;
+<<<<<<< Updated upstream
 }
+=======
+}
+
+int get_param_int(const nixl_b_params_t& params, const std::string& key, int default_value) {
+    auto it = params.find(key);
+    if (it != params.end() && !it->second.empty()) {
+        try {
+            return std::stoi(it->second);
+        } catch (const std::exception&) {
+            NIXL_WARN << "invalid parameter value for " << key << ": " << it->second
+                      << ", using default " << default_value;
+        }
+    }
+    return default_value;
+}
+>>>>>>> Stashed changes
