@@ -21,14 +21,14 @@ endif
 if 'OFI' in static_plugins
     ofi_backend_lib = static_library('OFI',
                'ofi_backend.cpp', 'ofi_backend.h', 'ofi_plugin.cpp', 'ofi_utils.cpp', 'ofi_utils.h',
-               dependencies: [nixl_infra, nixl_common_deps, libfabric_dep],
+               dependencies: [nixl_infra, nixl_common_dep, libfabric_dep],
                include_directories: [nixl_inc_dirs, utils_inc_dirs],
                install: false,
                name_prefix: 'libplugin_')
 else
     ofi_backend_lib = shared_library('OFI',
                'ofi_backend.cpp', 'ofi_backend.h', 'ofi_plugin.cpp', 'ofi_utils.cpp', 'ofi_utils.h',
-               dependencies: [nixl_infra, nixl_common_deps, libfabric_dep],
+               dependencies: [nixl_infra, nixl_common_dep, libfabric_dep],
                include_directories: [nixl_inc_dirs, utils_inc_dirs],
                install: true,
                cpp_args : ['-fPIC'],

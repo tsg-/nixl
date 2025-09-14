@@ -436,4 +436,8 @@ void nixlPluginManager::registerBuiltinPlugins() {
 #ifdef STATIC_PLUGIN_HF3FS
     NIXL_REGISTER_STATIC_PLUGIN(HF3FS)
 #endif
+
+#ifdef STATIC_PLUGIN_OFI
+    NIXL_REGISTER_STATIC_PLUGIN(OFI)
+#endif
 }
