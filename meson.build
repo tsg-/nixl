@@ -190,8 +190,28 @@ if ucx_dep.found() and cuda_dep.found() and nvcc_prog.found()
   }, section: 'UCX GPU Device API', bool_yn: true)
 endif
 
+# libfabrics/OFI detection
+libfabric_path = get_option('libfabric_path')
+if libfabric_path != ''
+  libfabric_lib_path = libfabric_path + '/lib'
+  libfabric_inc_path = libfabric_path + '/include'
+  libfabric_dep = declare_dependency(
+    link_args : ['-L' + libfabric_lib_path, '-lfabric'],
+    include_directories : include_directories(libfabric_inc_path))
+else
+  libfabric_dep = dependency('libfabric', required: false)
+endif
+
+if not libfabric_dep.found()
+  libfabric_dep = cpp.find_library('fabric', required: false)
+endif
+
 if get_option('disable_gds_backend')
     add_project_arguments('-DDISABLE_GDS_BACKEND', language: 'cpp')
+endif
+
+if get_option('disable_ofi_backend')
+    add_project_arguments('-DDISABLE_OFI_BACKEND', language: 'cpp')
 endif
 
 # Configure NDEBUG for release builds
