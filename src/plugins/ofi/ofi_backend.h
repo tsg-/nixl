@@ -37,10 +37,19 @@
 class nixlOfiConnection : public nixlBackendConnMD {
     private:
         std::string remoteAgent;
-        // placeholder for ofi endpoint handles
+        fi_addr_t fi_addr;
+        bool handshake_complete;
 
     public:
-        // placeholder getters
+        nixlOfiConnection() : fi_addr(FI_ADDR_UNSPEC), handshake_complete(false) {}
+
+        [[nodiscard]] fi_addr_t getFiAddr() const noexcept {
+            return fi_addr;
+        }
+
+        [[nodiscard]] bool isHandshakeComplete() const noexcept {
+            return handshake_complete;
+        }
 
     friend class nixlOfiEngine;
 };
@@ -222,6 +231,24 @@ private:
 
     void
     appendNotif(std::string remote_name, std::string msg);
+};
+
+class nixlOfiBackendReqH : public nixlBackendReqH {
+public:
+    struct fi_context context;
+    fi_addr_t remote_fi_addr;
+    uint64_t remote_key;
+    void *remote_addr;
+    size_t transfer_size;
+    nixl_xfer_op_t operation;
+    bool completed;
+
+    nixlOfiBackendReqH() : nixlBackendReqH(), completed(false), remote_fi_addr(FI_ADDR_UNSPEC),
+                           remote_key(0), remote_addr(nullptr), transfer_size(0) {
+        memset(&context, 0, sizeof(context));
+    }
+
+    virtual ~nixlOfiBackendReqH() {}
 };
 
 #endif

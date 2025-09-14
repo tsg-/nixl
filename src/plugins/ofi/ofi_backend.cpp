@@ -118,17 +118,74 @@ nixl_status_t nixlOfiEngine::loadRemoteConnInfo(const std::string &remote_agent,
     conn->remoteAgent = remote_agent;
 
     // insert remote address into address vector
-    fi_addr_t fi_addr;
-    int ret = fi_av_insert(nixlOfiUtils::av, remote_conn_info.data(), 1, &fi_addr, 0, nullptr);
+    int ret = fi_av_insert(nixlOfiUtils::av, remote_conn_info.data(), 1, &conn->fi_addr, 0, nullptr);
     if (ret != 1) {
         NIXL_ERROR << "fi_av_insert failed: " << fi_strerror(-ret);
         return NIXL_ERR_BACKEND;
     }
 
-    // store the address for future use (would add fi_addr to connection object)
+    // perform handshake (following server_bw.c pattern)
+    // allocate temporary handshake buffer
+    const size_t handshake_size = 64;
+    std::vector<char> handshake_buf(handshake_size);
+
+    // register handshake buffer
+    struct fid_mr *handshake_mr = nullptr;
+    struct fi_mr_attr attr = {0};
+    struct iovec iov = {0};
+
+    iov.iov_base = handshake_buf.data();
+    iov.iov_len = handshake_size;
+
+    attr.mr_iov = &iov;
+    attr.iov_count = 1;
+    attr.access = FI_SEND | FI_RECV;
+    attr.offset = 0;
+    attr.requested_key = FI_KEY_NOTAVAIL;
+    attr.context = nullptr;
+    attr.iface = FI_HMEM_SYSTEM;
+
+    ret = fi_mr_regattr(nixlOfiUtils::domain, &attr, 0, &handshake_mr);
+    if (ret) {
+        NIXL_ERROR << "handshake buffer registration failed: " << fi_strerror(-ret);
+        return NIXL_ERR_BACKEND;
+    }
+
+    void *handshake_desc = fi_mr_desc(handshake_mr);
+
+    // post receive for handshake (following server_bw.c pattern)
+    struct fi_context rx_ctx;
+    ret = fi_recv(nixlOfiUtils::ep, handshake_buf.data(), handshake_size,
+                  handshake_desc, conn->fi_addr, &rx_ctx);
+    if (ret) {
+        NIXL_ERROR << "fi_recv for handshake failed: " << fi_strerror(-ret);
+        fi_close(&handshake_mr->fid);
+        return NIXL_ERR_BACKEND;
+    }
+
+    // wait for handshake completion
+    struct fi_cq_err_entry comp;
+    int cq_ret;
+    do {
+        cq_ret = fi_cq_read(nixlOfiUtils::rxcq, &comp, 1);
+    } while (cq_ret == -FI_EAGAIN);
+
+    if (cq_ret < 0) {
+        NIXL_ERROR << "handshake completion failed: " << fi_strerror(-cq_ret);
+        fi_close(&handshake_mr->fid);
+        return NIXL_ERR_BACKEND;
+    }
+
+    // cleanup handshake buffer
+    fi_close(&handshake_mr->fid);
+
+    // mark handshake as complete
+    conn->handshake_complete = true;
+
+    // store connection
     remoteConnMap.insert({remote_agent, conn});
 
-    NIXL_DEBUG << "loaded connection info for agent: " << remote_agent;
+    NIXL_DEBUG << "completed handshake and loaded connection info for agent: " << remote_agent;
     return NIXL_SUCCESS;
 }
 
@@ -238,9 +295,53 @@ nixl_status_t nixlOfiEngine::prepXfer(const nixl_xfer_op_t &operation,
                                       const std::string &remote_agent,
                                       nixlBackendReqH* &handle,
                                       const nixl_opt_b_args_t* opt_args) const {
-    // placeholder implementation
-    handle = nullptr;
-    return NIXL_ERR_NOT_SUPPORTED;
+    // get connection
+    auto conn = getConnection(remote_agent);
+    if (!conn || !conn->isHandshakeComplete()) {
+        NIXL_ERROR << "no valid connection for agent: " << remote_agent;
+        return NIXL_ERR_NOT_FOUND;
+    }
+
+    // validate descriptors - for simplicity, handle single descriptor for now
+    if (local.empty() || remote.empty()) {
+        NIXL_ERROR << "empty descriptor lists";
+        return NIXL_ERR_INVALID_PARAM;
+    }
+
+    if (local.size() != remote.size()) {
+        NIXL_ERROR << "local and remote descriptor count mismatch";
+        return NIXL_ERR_INVALID_PARAM;
+    }
+
+    // create request handle
+    auto ofi_handle = std::make_unique<nixlOfiBackendReqH>();
+    ofi_handle->operation = operation;
+    ofi_handle->remote_fi_addr = conn->getFiAddr();
+
+    // get first descriptor pair (simplified - would need loop for multiple)
+    const auto &local_desc = local.front();
+    const auto &remote_desc = remote.front();
+
+    // extract remote metadata (key + address)
+    if (remote_desc.md) {
+        // for remote metadata, we need to parse the public key string
+        std::string key_str;
+        nixl_status_t status = getPublicData(remote_desc.md, key_str);
+        if (status != NIXL_SUCCESS) {
+            return status;
+        }
+        ofi_handle->remote_key = std::stoull(key_str);
+    }
+
+    ofi_handle->remote_addr = (void*)remote_desc.addr;
+    ofi_handle->transfer_size = std::min(local_desc.len, remote_desc.len);
+
+    NIXL_DEBUG << "prepared " << (operation == NIXL_READ ? "READ" : "WRITE")
+               << " operation: size=" << ofi_handle->transfer_size
+               << " remote_key=" << ofi_handle->remote_key;
+
+    handle = ofi_handle.release();
+    return NIXL_SUCCESS;
 }
 
 nixl_status_t nixlOfiEngine::estimateXferCost(const nixl_xfer_op_t &operation,
@@ -265,17 +366,123 @@ nixlOfiEngine::postXfer(const nixl_xfer_op_t &operation,
                         const std::string &remote_agent,
                         nixlBackendReqH *&handle,
                         const nixl_opt_b_args_t *opt_args) const {
-    // placeholder implementation
-    return NIXL_ERR_NOT_SUPPORTED;
-}
+    nixlOfiBackendReqH *ofi_handle = static_cast<nixlOfiBackendReqH*>(handle);
+    if (!ofi_handle) {
+        NIXL_ERROR << "invalid request handle";
+        return NIXL_ERR_INVALID_PARAM;
+    }
 
-nixl_status_t nixlOfiEngine::checkXfer(nixlBackendReqH* handle) const {
-    // placeholder implementation
+    // get local descriptor info
+    const auto &local_desc = local.front();
+    const nixlOfiPrivateMetadata *local_md = static_cast<const nixlOfiPrivateMetadata*>(local_desc.md);
+    if (!local_md) {
+        NIXL_ERROR << "missing local metadata";
+        return NIXL_ERR_INVALID_PARAM;
+    }
+
+    void *local_addr = (void*)local_desc.addr;
+    void *mr_desc = local_md->getMrDesc();
+
+    // post RMA operation following server_bw.c pattern
+    int ret;
+    switch (ofi_handle->operation) {
+    case NIXL_READ:
+        // fi_read: read from remote memory into local buffer
+        ret = fi_read(nixlOfiUtils::ep, local_addr, ofi_handle->transfer_size, mr_desc,
+                      ofi_handle->remote_fi_addr, (uint64_t)ofi_handle->remote_addr,
+                      ofi_handle->remote_key, &ofi_handle->context);
+        break;
+
+    case NIXL_WRITE:
+        // fi_write: write from local buffer to remote memory
+        ret = fi_write(nixlOfiUtils::ep, local_addr, ofi_handle->transfer_size, mr_desc,
+                       ofi_handle->remote_fi_addr, (uint64_t)ofi_handle->remote_addr,
+                       ofi_handle->remote_key, &ofi_handle->context);
+        break;
+
+    default:
+        NIXL_ERROR << "unsupported operation: " << operation;
+        return NIXL_ERR_INVALID_PARAM;
+    }
+
+    // handle -FI_EAGAIN retry loop like server_bw.c
+    while (ret == -FI_EAGAIN) {
+        // check completion queue to make progress
+        struct fi_cq_err_entry comp;
+        int cq_ret = fi_cq_read(nixlOfiUtils::txcq, &comp, 1);
+        if (cq_ret >= 0 || cq_ret != -FI_EAGAIN) {
+            // made progress, retry the operation
+            switch (ofi_handle->operation) {
+            case NIXL_READ:
+                ret = fi_read(nixlOfiUtils::ep, local_addr, ofi_handle->transfer_size, mr_desc,
+                              ofi_handle->remote_fi_addr, (uint64_t)ofi_handle->remote_addr,
+                              ofi_handle->remote_key, &ofi_handle->context);
+                break;
+            case NIXL_WRITE:
+                ret = fi_write(nixlOfiUtils::ep, local_addr, ofi_handle->transfer_size, mr_desc,
+                               ofi_handle->remote_fi_addr, (uint64_t)ofi_handle->remote_addr,
+                               ofi_handle->remote_key, &ofi_handle->context);
+                break;
+            }
+        }
+    }
+
+    if (ret) {
+        NIXL_ERROR << "fi_" << (ofi_handle->operation == NIXL_READ ? "read" : "write")
+                   << " failed: " << fi_strerror(-ret);
+        return NIXL_ERR_BACKEND;
+    }
+
+    NIXL_DEBUG << "posted " << (ofi_handle->operation == NIXL_READ ? "READ" : "WRITE")
+               << " operation: size=" << ofi_handle->transfer_size;
+
     return NIXL_SUCCESS;
 }
 
+nixl_status_t nixlOfiEngine::checkXfer(nixlBackendReqH* handle) const {
+    nixlOfiBackendReqH *ofi_handle = static_cast<nixlOfiBackendReqH*>(handle);
+    if (!ofi_handle) {
+        NIXL_ERROR << "invalid request handle";
+        return NIXL_ERR_INVALID_PARAM;
+    }
+
+    if (ofi_handle->completed) {
+        return NIXL_SUCCESS;
+    }
+
+    // check completion queue following server_bw.c pattern
+    struct fi_cq_err_entry comp;
+    int ret = fi_cq_read(nixlOfiUtils::txcq, &comp, 1);
+
+    if (ret == -FI_EAGAIN) {
+        // no completion yet, still in progress
+        return NIXL_IN_PROG;
+    }
+
+    if (ret < 0) {
+        NIXL_ERROR << "completion queue read failed: " << fi_strerror(-ret);
+        return NIXL_ERR_BACKEND;
+    }
+
+    // check if this completion matches our request
+    if (comp.op_context == &ofi_handle->context) {
+        ofi_handle->completed = true;
+        NIXL_DEBUG << "transfer completed: size=" << ofi_handle->transfer_size;
+        return NIXL_SUCCESS;
+    }
+
+    // completion was for a different request, still waiting
+    return NIXL_IN_PROG;
+}
+
 nixl_status_t nixlOfiEngine::releaseReqH(nixlBackendReqH* handle) const {
-    // placeholder implementation
+    nixlOfiBackendReqH *ofi_handle = static_cast<nixlOfiBackendReqH*>(handle);
+    if (!ofi_handle) {
+        NIXL_WARN << "attempted to release null request handle";
+        return NIXL_ERR_INVALID_PARAM;
+    }
+
+    delete ofi_handle;
     return NIXL_SUCCESS;
 }
 
