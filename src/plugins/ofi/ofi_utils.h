@@ -46,9 +46,9 @@ public:
     static struct fid_cq *txcq;
     static struct fid_cq *rxcq;
     static struct fid_av *av;
+    static bool fabric_initialized;
 
 private:
-    static bool fabric_initialized;
 };
 
 // placeholder for ofi status conversion
@@ -64,5 +64,8 @@ std::string get_param_string(const nixl_b_params_t& params, const std::string& k
 
 // convert binary address data to human-readable string
 std::string addr_to_string(const void* addr_data, size_t addr_len);
+
+// Manual progress driving for FI_PROGRESS_MANUAL providers
+void drive_manual_progress();
 
 #endif

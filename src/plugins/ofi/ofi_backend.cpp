@@ -402,6 +402,9 @@ nixlOfiEngine::postXfer(const nixl_xfer_op_t &operation,
         return NIXL_ERR_INVALID_PARAM;
     }
 
+    // Drive progress before attempting the operation - CRITICAL for FI_PROGRESS_MANUAL
+    drive_manual_progress();
+
     // handle -FI_EAGAIN retry loop following LibFabric best practices
     int retry_count = 0;
     const auto &backend_params = getCustomParams();
@@ -411,9 +414,8 @@ nixlOfiEngine::postXfer(const nixl_xfer_op_t &operation,
     while (ret == -FI_EAGAIN && retry_count < max_retries) {
         retry_count++;
 
-        // drive progress by attempting to read completions (doesn't matter if successful)
-        struct fi_cq_err_entry comp;
-        fi_cq_read(nixlOfiUtils::txcq, &comp, 1);  // ignore return value - just drive progress
+        // drive progress using proper manual progress function
+        drive_manual_progress();
 
         // small delay to avoid busy waiting
         usleep(retry_delay_us);

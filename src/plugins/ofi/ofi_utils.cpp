@@ -311,3 +311,39 @@ std::string addr_to_string(const void* addr_data, size_t addr_len) {
 
     return "unknown_family_" + std::to_string(sa->sa_family);
 }
+
+void drive_manual_progress() {
+    if (!nixlOfiUtils::fabric_initialized) {
+        return;
+    }
+
+    // Drive progress on all completion queues to advance RMA operations
+    // This is CRITICAL for FI_PROGRESS_MANUAL providers like verbs;ofi_rxm
+
+    if (nixlOfiUtils::txcq) {
+        // Drive TX progress - RMA operations post to TX queue
+        struct fi_cq_entry comp[4];
+        int ret = fi_cq_read(nixlOfiUtils::txcq, comp, 4);
+        if (ret > 0) {
+            NIXL_DEBUG << "[MANUAL_PROGRESS] processed " << ret << " TX completions";
+        } else if (ret == -FI_EAVAIL) {
+            // Handle CQ errors but continue driving progress
+            struct fi_cq_err_entry err;
+            fi_cq_readerr(nixlOfiUtils::txcq, &err, 0);
+            NIXL_DEBUG << "[MANUAL_PROGRESS] TX CQ error: " << fi_strerror(err.err);
+        }
+    }
+
+    if (nixlOfiUtils::rxcq) {
+        // Drive RX progress - may be needed for some providers
+        struct fi_cq_entry comp[4];
+        int ret = fi_cq_read(nixlOfiUtils::rxcq, comp, 4);
+        if (ret > 0) {
+            NIXL_DEBUG << "[MANUAL_PROGRESS] processed " << ret << " RX completions";
+        } else if (ret == -FI_EAVAIL) {
+            struct fi_cq_err_entry err;
+            fi_cq_readerr(nixlOfiUtils::rxcq, &err, 0);
+            NIXL_DEBUG << "[MANUAL_PROGRESS] RX CQ error: " << fi_strerror(err.err);
+        }
+    }
+}
