@@ -50,6 +50,15 @@ nixlOfiEngine::nixlOfiEngine(const nixlBackendInitParams &init_params)
         initErr = true;
         return;
     }
+
+    // store our local connection info (similar to UCX workerAddr)
+    status = getConnInfo(localConnInfo);
+    if (status != NIXL_SUCCESS) {
+        NIXL_ERROR << "failed to get local connection info during initialization";
+        initErr = true;
+        return;
+    }
+
     NIXL_INFO << "OFI backend initialized";
 }
 
@@ -92,11 +101,9 @@ nixl_status_t nixlOfiEngine::getConnInfo(std::string &str) const {
 
 nixl_status_t nixlOfiEngine::connect(const std::string &remote_agent) {
     if(remote_agent == localAgent) {
-        return loadRemoteConnInfo(remote_agent, workerAddr);
+        return loadRemoteConnInfo(remote_agent, localConnInfo);
     }
-
-    return (remoteConnMap.find(remote_agent) == remoteConnMap.end()) ? NIXL_ERR_NOT_FOUND :
-                                                                       NIXL_SUCCESS;
+    return (remoteConnMap.find(remote_agent) == remoteConnMap.end()) ? NIXL_ERR_NOT_FOUND : NIXL_SUCCESS;
 }
 
 nixl_status_t nixlOfiEngine::disconnect(const std::string &remote_agent) {
@@ -124,6 +131,9 @@ nixl_status_t nixlOfiEngine::loadRemoteConnInfo(const std::string &remote_agent,
     // create connection object
     auto conn = std::make_shared<nixlOfiConnection>();
     conn->remoteAgent = remote_agent;
+
+    NIXL_DEBUG << "loadRemoteConnInfo: agent=" << remote_agent
+               << ", conn_info_size=" << remote_conn_info.size();
 
     // skip address insertion for empty connection info (intra-agent case)
     if (remote_conn_info.empty()) {
@@ -172,7 +182,7 @@ nixl_status_t nixlOfiEngine::registerMem(const nixlBlobDesc &mem,
 
     attr.mr_iov = &iov;
     attr.iov_count = 1;
-    attr.access = FI_MR_RMA_EVENT | FI_MR_HMEM | FI_MR_COLLECTIVE; // exact match with server_bw.c
+    attr.access = FI_READ | FI_WRITE | FI_REMOTE_READ | FI_REMOTE_WRITE; // standard RMA access flags
     attr.offset = 0;
     attr.requested_key = 1; // FT_MR_KEY from server_bw.c
     attr.context = nullptr;
@@ -388,6 +398,17 @@ nixlOfiEngine::postXfer(const nixl_xfer_op_t &operation,
         ret = fi_read(nixlOfiUtils::ep, local_addr, ofi_handle->transfer_size, mr_desc,
                       ofi_handle->remote_fi_addr, (uint64_t)ofi_handle->remote_addr,
                       ofi_handle->remote_key, &ofi_handle->context);
+        NIXL_DEBUG << "fi_read returned: " << (ret == 0 ? "SUCCESS" : fi_strerror(-ret))
+                   << " (code: " << ret << ")";
+
+        // if immediate failure, check completion queue for errors
+        if (ret != 0) {
+            struct fi_cq_err_entry err;
+            if (fi_cq_readerr(nixlOfiUtils::txcq, &err, 0) > 0) {
+                NIXL_ERROR << "LibFabric CQ error: " << fi_strerror(err.err)
+                          << " (code: " << err.err << "), prov_errno: " << err.prov_errno;
+            }
+        }
         break;
 
     case NIXL_WRITE:
@@ -395,6 +416,8 @@ nixlOfiEngine::postXfer(const nixl_xfer_op_t &operation,
         ret = fi_write(nixlOfiUtils::ep, local_addr, ofi_handle->transfer_size, mr_desc,
                        ofi_handle->remote_fi_addr, (uint64_t)ofi_handle->remote_addr,
                        ofi_handle->remote_key, &ofi_handle->context);
+        NIXL_DEBUG << "fi_write returned: " << (ret == 0 ? "SUCCESS" : fi_strerror(-ret))
+                   << " (code: " << ret << ")";
         break;
 
     default:
@@ -402,8 +425,31 @@ nixlOfiEngine::postXfer(const nixl_xfer_op_t &operation,
         return NIXL_ERR_INVALID_PARAM;
     }
 
-    // Drive progress before attempting the operation - CRITICAL for FI_PROGRESS_MANUAL
-    drive_manual_progress();
+    NIXL_DEBUG << "attempting " << (ofi_handle->operation == NIXL_READ ? "READ" : "WRITE")
+               << " operation: local_addr=" << local_addr
+               << ", size=" << ofi_handle->transfer_size
+               << ", remote_addr=" << (void*)ofi_handle->remote_addr
+               << ", remote_key=" << ofi_handle->remote_key
+               << ", remote_fi_addr=" << ofi_handle->remote_fi_addr;
+
+    // debug: check if this is local vs remote operation
+    if (ofi_handle->remote_fi_addr == 0) {
+        NIXL_DEBUG << "LOCAL operation detected (fi_addr=0)";
+    } else {
+        NIXL_DEBUG << "REMOTE operation detected (fi_addr=" << ofi_handle->remote_fi_addr << ")";
+    }
+
+    // check for invalid fi_addr which would cause operation failures
+    if (ofi_handle->remote_fi_addr == FI_ADDR_UNSPEC) {
+        NIXL_ERROR << "invalid remote_fi_addr (FI_ADDR_UNSPEC) - connection not properly established";
+        return NIXL_ERR_BACKEND;
+    }
+
+    // drive progress aggressively before attempting the operation (FI_PROGRESS_MANUAL)
+    // multiple calls to ensure CQs are drained and provider is ready
+    for (int i = 0; i < 10; i++) {
+        drive_manual_progress();
+    }
 
     // handle -FI_EAGAIN retry loop following LibFabric best practices
     int retry_count = 0;
@@ -414,11 +460,25 @@ nixlOfiEngine::postXfer(const nixl_xfer_op_t &operation,
     while (ret == -FI_EAGAIN && retry_count < max_retries) {
         retry_count++;
 
+        if (retry_count % 100 == 0) {
+            NIXL_DEBUG << "RMA operation retry " << retry_count << "/" << max_retries
+                       << " still getting -FI_EAGAIN";
+        }
+
         // drive progress using proper manual progress function
         drive_manual_progress();
 
+        // more aggressive progress driving for stubborn providers
+        if (retry_count % 50 == 0) {
+            for (int i = 0; i < 5; i++) {
+                drive_manual_progress();
+            }
+        }
+
         // small delay to avoid busy waiting
-        usleep(retry_delay_us);
+        if (retry_delay_us > 0) {
+            usleep(retry_delay_us);
+        }
 
         // retry the operation
         switch (ofi_handle->operation) {
@@ -443,8 +503,12 @@ nixlOfiEngine::postXfer(const nixl_xfer_op_t &operation,
 
     if (ret) {
         NIXL_ERROR << "fi_" << (ofi_handle->operation == NIXL_READ ? "read" : "write")
-                   << " failed: " << fi_strerror(-ret);
+                   << " failed: " << fi_strerror(-ret) << " (code: " << ret << ")"
+                   << ", remote_fi_addr=" << ofi_handle->remote_fi_addr
+                   << ", remote_key=" << ofi_handle->remote_key;
         return NIXL_ERR_BACKEND;
+    } else {
+        NIXL_DEBUG << "LibFabric operation posted successfully after " << retry_count << " retries";
     }
 
     NIXL_DEBUG << "posted " << (ofi_handle->operation == NIXL_READ ? "READ" : "WRITE")

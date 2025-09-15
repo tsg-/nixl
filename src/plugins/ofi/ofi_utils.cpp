@@ -18,6 +18,7 @@
 #include "ofi_utils.h"
 #include "common/nixl_log.h"
 #include <cstring>
+#include <algorithm>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 
@@ -48,6 +49,10 @@ nixl_status_t nixlOfiUtils::setupFabric(const nixl_b_params_t& params) {
         return NIXL_SUCCESS;
     }
 
+    // enable libfabric debug logging before any fi_ calls
+    setenv("FI_LOG_LEVEL", "debug", 0);  // don't overwrite if already set
+    setenv("FI_LOG_PROV", "verbs", 0);
+
     NIXL_INFO << "setting up ofi fabric";
     int ret;
 
@@ -58,16 +63,20 @@ nixl_status_t nixlOfiUtils::setupFabric(const nixl_b_params_t& params) {
         return NIXL_ERR_BACKEND;
     }
 
-    hints->caps = FI_MSG | FI_RMA | FI_READ | FI_WRITE | FI_REMOTE_READ | FI_REMOTE_WRITE;
-    hints->mode = FI_CONTEXT;
-    hints->addr_format = FI_FORMAT_UNSPEC;
+    // use exact "verbs" configuration from SUPPORTED_PROVIDERS in ofi_utils_save.cpp
+    hints->caps = FI_MSG | FI_RMA | FI_READ | FI_RECV | FI_SEND | FI_REMOTE_READ | FI_MULTI_RECV | FI_LOCAL_COMM | FI_REMOTE_COMM;
+    hints->mode = 0;
+    hints->addr_format = FI_SOCKADDR_IN;
     hints->ep_attr->type = FI_EP_RDM;
-    hints->domain_attr->threading = FI_THREAD_DOMAIN;
-    hints->domain_attr->control_progress = FI_PROGRESS_UNSPEC;
-    hints->domain_attr->data_progress = FI_PROGRESS_UNSPEC;
+    hints->domain_attr->threading = FI_THREAD_SAFE;
+    hints->domain_attr->control_progress = FI_PROGRESS_AUTO;
+    hints->domain_attr->data_progress = FI_PROGRESS_MANUAL;
     hints->domain_attr->resource_mgmt = FI_RM_ENABLED;
-    hints->domain_attr->mr_mode = FI_MR_LOCAL | FI_MR_RAW | FI_MR_VIRT_ADDR |
-                                  FI_MR_ALLOCATED | FI_MR_PROV_KEY | FI_MR_ENDPOINT;
+    hints->domain_attr->mr_mode = FI_MR_LOCAL | FI_MR_VIRT_ADDR | FI_MR_ALLOCATED | FI_MR_PROV_KEY;
+
+    // set tx/rx attributes to enable completions as per verbs config
+    hints->tx_attr->op_flags = FI_COMPLETION;
+    hints->rx_attr->op_flags = FI_COMPLETION;
 
     // set provider from params with default
     std::string provider = get_param_string(params, "ofi_provider", "verbs;ofi_rxm");
@@ -99,6 +108,9 @@ nixl_status_t nixlOfiUtils::setupFabric(const nixl_b_params_t& params) {
 
     NIXL_INFO << "using provider: " << fi->fabric_attr->prov_name;
 
+    // validate that provider meets our requirements
+    validate_provider_capabilities(hints, fi);
+
     // create fabric
     ret = fi_fabric(fi->fabric_attr, &fabric, nullptr);
     if (ret) {
@@ -122,9 +134,11 @@ nixl_status_t nixlOfiUtils::setupFabric(const nixl_b_params_t& params) {
 
     // create completion queues
     struct fi_cq_attr cq_attr = {0};
+    cq_attr.format = FI_CQ_FORMAT_CONTEXT; // standard completion format
+    cq_attr.wait_obj = FI_WAIT_NONE;       // no wait object, manual polling
 
-    // get tx cq size from params
-    cq_attr.size = get_param_int(params, "tx_cq_size", 1024);
+    // get tx cq size from params - use larger default for better buffering
+    cq_attr.size = get_param_int(params, "tx_cq_size", 4096);
 
     ret = fi_cq_open(domain, &cq_attr, &txcq, nullptr);
     if (ret) {
@@ -132,8 +146,8 @@ nixl_status_t nixlOfiUtils::setupFabric(const nixl_b_params_t& params) {
         return NIXL_ERR_BACKEND;
     }
 
-    // get rx cq size from params
-    cq_attr.size = get_param_int(params, "rx_cq_size", 1024);
+    // get rx cq size from params - use larger default for better buffering
+    cq_attr.size = get_param_int(params, "rx_cq_size", 4096);
 
     ret = fi_cq_open(domain, &cq_attr, &rxcq, nullptr);
     if (ret) {
@@ -158,11 +172,14 @@ nixl_status_t nixlOfiUtils::setupFabric(const nixl_b_params_t& params) {
         return NIXL_ERR_BACKEND;
     }
 
+    // Bind TX CQ - start with basic FI_TRANSMIT, RMA completions will appear here
     ret = fi_ep_bind(ep, &txcq->fid, FI_TRANSMIT);
     if (ret) {
         NIXL_ERROR << "fi_ep_bind txcq failed: " << fi_strerror(-ret);
         return NIXL_ERR_BACKEND;
     }
+
+    NIXL_INFO << "TX CQ bound with: FI_TRANSMIT (RMA completions will appear on this CQ)";
 
     ret = fi_ep_bind(ep, &rxcq->fid, FI_RECV);
     if (ret) {
@@ -177,8 +194,52 @@ nixl_status_t nixlOfiUtils::setupFabric(const nixl_b_params_t& params) {
         return NIXL_ERR_BACKEND;
     }
 
+    // for verbs;ofi_rxm provider, post some receive buffers to avoid -FI_EAGAIN
+    // this is required for proper RMA operation with RXM utility provider
+    if (fi && fi->fabric_attr && fi->fabric_attr->prov_name) {
+        std::string prov_name(fi->fabric_attr->prov_name);
+        if (prov_name.find("rxm") != std::string::npos) {
+            NIXL_INFO << "detected RXM provider, posting initial receive buffers";
+
+            // allocate small receive buffers
+            const size_t recv_buf_size = 64; // small control messages
+            const int num_recv_bufs = 16;
+
+            for (int i = 0; i < num_recv_bufs; i++) {
+                void* recv_buf = malloc(recv_buf_size);
+                if (recv_buf) {
+                    ret = fi_recv(ep, recv_buf, recv_buf_size, nullptr, FI_ADDR_UNSPEC, recv_buf);
+                    if (ret && ret != -FI_EAGAIN) {
+                        NIXL_WARN << "fi_recv failed: " << fi_strerror(-ret);
+                        free(recv_buf);
+                        break;
+                    }
+                }
+            }
+
+            // drive progress to ensure receive buffers are processed
+            for (int i = 0; i < 100; i++) {
+                struct fi_cq_entry comp[4];
+                fi_cq_read(rxcq, comp, 4);
+                fi_cq_read(txcq, comp, 4);
+            }
+        }
+    }
+
     fabric_initialized = true;
     NIXL_INFO << "ofi fabric setup complete";
+
+    // Log progress model information
+    NIXL_INFO << "LibFabric Progress Model:";
+    NIXL_INFO << "  Data Progress: " << (fi->domain_attr->data_progress == FI_PROGRESS_MANUAL ? "MANUAL" :
+                                        fi->domain_attr->data_progress == FI_PROGRESS_AUTO ? "AUTO" : "UNSPEC");
+    NIXL_INFO << "  Control Progress: " << (fi->domain_attr->control_progress == FI_PROGRESS_MANUAL ? "MANUAL" :
+                                           fi->domain_attr->control_progress == FI_PROGRESS_AUTO ? "AUTO" : "UNSPEC");
+
+    if (fi->domain_attr->data_progress == FI_PROGRESS_MANUAL) {
+        NIXL_WARN << "*** MANUAL PROGRESS REQUIRED for data operations (including RMA) ***";
+    }
+
     return NIXL_SUCCESS;
 }
 
@@ -257,11 +318,11 @@ nixl_status_t ofi_status_to_nixl(int ofi_status) {
 nixl_b_params_t get_ofi_backend_common_options() {
     // common ofi backend options
     nixl_b_params_t params = {
-        {"ofi_provider", "verbs;ofi_rxm"},  // default to verbs with rxm utility provider
+        {"ofi_provider", "verbs;ofi_rxm"},  // use what's available and fix the issues
         {"ofi_domain", ""},                 // domain selection
         {"num_workers", "1"},               // number of worker threads
-        {"tx_cq_size", "1024"},             // transmit completion queue size
-        {"rx_cq_size", "1024"},             // receive completion queue size
+        {"tx_cq_size", "4096"},             // transmit completion queue size
+        {"rx_cq_size", "4096"},             // receive completion queue size
         {"retry_count", "1000"},            // max retries for -FI_EAGAIN operations
         {"retry_delay_us", "1"}             // delay in microseconds between retries
     };
@@ -285,6 +346,16 @@ std::string get_param_string(const nixl_b_params_t& params, const std::string& k
     auto it = params.find(key);
     if (it != params.end() && !it->second.empty()) {
         return it->second;
+    }
+    return default_value;
+}
+
+bool get_param_bool(const nixl_b_params_t& params, const std::string& key, bool default_value) {
+    auto it = params.find(key);
+    if (it != params.end() && !it->second.empty()) {
+        std::string value = it->second;
+        std::transform(value.begin(), value.end(), value.begin(), ::tolower);
+        return (value == "true" || value == "1" || value == "yes" || value == "on");
     }
     return default_value;
 }
@@ -317,17 +388,18 @@ void drive_manual_progress() {
         return;
     }
 
-    // Drive progress on all completion queues to advance RMA operations
-    // This is CRITICAL for FI_PROGRESS_MANUAL providers like verbs;ofi_rxm
+    // drive progress on all completion queues to advance RMA operations
+    // critical for FI_PROGRESS_MANUAL providers like verbs;ofi_rxm
 
     if (nixlOfiUtils::txcq) {
-        // Drive TX progress - RMA operations post to TX queue
-        struct fi_cq_entry comp[4];
-        int ret = fi_cq_read(nixlOfiUtils::txcq, comp, 4);
+        // drive TX progress - RMA operations post to TX queue
+        // use larger batch size for better progress
+        struct fi_cq_entry comp[16];
+        int ret = fi_cq_read(nixlOfiUtils::txcq, comp, 16);
         if (ret > 0) {
             NIXL_DEBUG << "[MANUAL_PROGRESS] processed " << ret << " TX completions";
         } else if (ret == -FI_EAVAIL) {
-            // Handle CQ errors but continue driving progress
+            // handle CQ errors but continue driving progress
             struct fi_cq_err_entry err;
             fi_cq_readerr(nixlOfiUtils::txcq, &err, 0);
             NIXL_DEBUG << "[MANUAL_PROGRESS] TX CQ error: " << fi_strerror(err.err);
@@ -335,9 +407,9 @@ void drive_manual_progress() {
     }
 
     if (nixlOfiUtils::rxcq) {
-        // Drive RX progress - may be needed for some providers
-        struct fi_cq_entry comp[4];
-        int ret = fi_cq_read(nixlOfiUtils::rxcq, comp, 4);
+        // drive RX progress - may be needed for some providers
+        struct fi_cq_entry comp[16];
+        int ret = fi_cq_read(nixlOfiUtils::rxcq, comp, 16);
         if (ret > 0) {
             NIXL_DEBUG << "[MANUAL_PROGRESS] processed " << ret << " RX completions";
         } else if (ret == -FI_EAVAIL) {
@@ -346,4 +418,79 @@ void drive_manual_progress() {
             NIXL_DEBUG << "[MANUAL_PROGRESS] RX CQ error: " << fi_strerror(err.err);
         }
     }
+}
+
+void validate_provider_capabilities(struct fi_info* hints, struct fi_info* result) {
+    if (!hints || !result) {
+        NIXL_ERROR << "Invalid arguments to validate_provider_capabilities";
+        return;
+    }
+
+#define NIXL_CHECK_PROVIDER_ATTR(condition, attr_name, req_val, res_val, to_str_type) \
+    NIXL_ASSERT_ALWAYS(condition) \
+        << "Provider does not support requested " << attr_name << ". " \
+        << "Requested: " << fi_tostr(&(req_val), to_str_type) \
+        << ", Got: " << fi_tostr(&(res_val), to_str_type)
+
+    // capabilities
+    NIXL_CHECK_PROVIDER_ATTR((result->caps & hints->caps) == hints->caps,
+        "capabilities", hints->caps, result->caps, FI_TYPE_CAPS);
+
+    // modes (only check if we specified requirements)
+    if (hints->mode != 0) {
+        NIXL_CHECK_PROVIDER_ATTR((result->mode & hints->mode) == hints->mode,
+            "modes", hints->mode, result->mode, FI_TYPE_MODE);
+    }
+
+    // endpoint type
+    if (hints->ep_attr && result->ep_attr) {
+        NIXL_CHECK_PROVIDER_ATTR(result->ep_attr->type == hints->ep_attr->type,
+            "endpoint type", hints->ep_attr->type, result->ep_attr->type, FI_TYPE_EP_TYPE);
+    }
+
+    // domain attributes
+    if (hints->domain_attr && result->domain_attr) {
+        // memory registration mode
+        if (hints->domain_attr->mr_mode != 0) {
+            NIXL_CHECK_PROVIDER_ATTR((result->domain_attr->mr_mode & hints->domain_attr->mr_mode) == hints->domain_attr->mr_mode,
+                "mr_mode", hints->domain_attr->mr_mode, result->domain_attr->mr_mode, FI_TYPE_MR_MODE);
+        }
+
+        // threading model
+        if (hints->domain_attr->threading != FI_THREAD_UNSPEC) {
+            NIXL_CHECK_PROVIDER_ATTR(result->domain_attr->threading == hints->domain_attr->threading,
+                "threading model", hints->domain_attr->threading, result->domain_attr->threading, FI_TYPE_THREADING);
+        }
+
+        // resource management model
+        if (hints->domain_attr->resource_mgmt != FI_RM_UNSPEC) {
+            NIXL_ASSERT_ALWAYS(result->domain_attr->resource_mgmt == hints->domain_attr->resource_mgmt)
+                << "Provider does not support requested resource_mgmt. "
+                << "Requested: " << (hints->domain_attr->resource_mgmt == FI_RM_ENABLED ? "FI_RM_ENABLED" : "OTHER")
+                << ", Got: " << (result->domain_attr->resource_mgmt == FI_RM_ENABLED ? "FI_RM_ENABLED" : "OTHER");
+        }
+    }
+
+    // address format
+    if (hints->addr_format != FI_FORMAT_UNSPEC) {
+        NIXL_CHECK_PROVIDER_ATTR(result->addr_format == hints->addr_format,
+            "address format", hints->addr_format, result->addr_format, FI_TYPE_ADDR_FORMAT);
+    }
+
+    // tx attributes
+    if (hints->tx_attr && result->tx_attr && hints->tx_attr->op_flags != 0) {
+        NIXL_CHECK_PROVIDER_ATTR((result->tx_attr->op_flags & hints->tx_attr->op_flags) == hints->tx_attr->op_flags,
+            "tx_attr->op_flags", hints->tx_attr->op_flags, result->tx_attr->op_flags, FI_TYPE_OP_FLAGS);
+    }
+
+    // rx attributes
+    if (hints->rx_attr && result->rx_attr && hints->rx_attr->op_flags != 0) {
+        NIXL_CHECK_PROVIDER_ATTR((result->rx_attr->op_flags & hints->rx_attr->op_flags) == hints->rx_attr->op_flags,
+            "rx_attr->op_flags", hints->rx_attr->op_flags, result->rx_attr->op_flags, FI_TYPE_OP_FLAGS);
+    }
+
+#undef NIXL_CHECK_PROVIDER_ATTR
+
+    NIXL_INFO << "provider capability validation passed";
+    NIXL_INFO << "provider modes: " << fi_tostr(&(result->mode), FI_TYPE_MODE);
 }

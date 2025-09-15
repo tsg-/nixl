@@ -62,10 +62,15 @@ int get_param_int(const nixl_b_params_t& params, const std::string& key, int def
 
 std::string get_param_string(const nixl_b_params_t& params, const std::string& key, const std::string& default_value);
 
+bool get_param_bool(const nixl_b_params_t& params, const std::string& key, bool default_value);
+
 // convert binary address data to human-readable string
 std::string addr_to_string(const void* addr_data, size_t addr_len);
 
 // Manual progress driving for FI_PROGRESS_MANUAL providers
 void drive_manual_progress();
+
+// Helper function to validate that the selected provider meets all requirements
+void validate_provider_capabilities(struct fi_info* hints, struct fi_info* result);
 
 #endif

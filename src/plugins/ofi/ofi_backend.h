@@ -222,8 +222,8 @@ protected:
     nixlOfiEngine(const nixlBackendInitParams &init_params);
 
 private:
-    // placeholder for ofi fabric and domain handles
-    std::string workerAddr;
+    // store our local endpoint connection info (equivalent to UCX workerAddr)
+    std::string localConnInfo;
 
     /* notifications */
     notif_list_t notifMainList;
