@@ -193,6 +193,11 @@ nixl_status_t nixlOfiEngine::registerMem(const nixlBlobDesc &mem,
     // create serialized key string for remote access
     priv->keyStr = std::to_string(priv->mr_key);
 
+    NIXL_DEBUG << "Memory registration complete:";
+    NIXL_DEBUG << "  mr_key (raw): " << priv->mr_key;
+    NIXL_DEBUG << "  keyStr: '" << priv->keyStr << "'";
+    NIXL_DEBUG << "  keyStr.length(): " << priv->keyStr.length();
+
     NIXL_DEBUG << "registered memory: addr=" << priv->addr
                << " len=" << priv->length
                << " key=" << priv->mr_key;
@@ -257,9 +262,24 @@ nixl_status_t nixlOfiEngine::loadRemoteMD(const nixlBlobDesc &input,
     // store connection reference in metadata
     remote_md->conn = conn;
 
+    // parse the memory key from the blob data
+    if (!input.metaInfo.empty()) {
+        try {
+            remote_md->remote_key = std::stoull(input.metaInfo);
+            NIXL_DEBUG << "parsed remote memory key: " << remote_md->remote_key << " from blob: '" << input.metaInfo << "'";
+        } catch (const std::exception& e) {
+            NIXL_ERROR << "failed to parse remote memory key from blob data: " << e.what();
+            return NIXL_ERR_INVALID_PARAM;
+        }
+    } else {
+        NIXL_WARN << "no blob data provided for remote memory key";
+        remote_md->remote_key = 0;  // fallback
+    }
+
     NIXL_DEBUG << "loaded remote metadata for agent: " << remote_agent
                << " memory: " << std::hex << input.addr
-               << " size: " << input.len;
+               << " size: " << input.len
+               << " key: " << std::dec << remote_md->remote_key;
 
     output = remote_md.release();
     return NIXL_SUCCESS;
@@ -305,18 +325,10 @@ nixl_status_t nixlOfiEngine::prepXfer(const nixl_xfer_op_t &operation,
 
     // extract remote metadata (key + address)
     if (remote_desc.metadataP) {
-        // for remote metadata, we need to parse the public key string
-        std::string key_str;
-        nixl_status_t status = getPublicData(remote_desc.metadataP, key_str);
-        if (status != NIXL_SUCCESS) {
-            return status;
-        }
-        try {
-            ofi_handle->remote_key = std::stoull(key_str);
-        } catch (const std::exception& e) {
-            NIXL_ERROR << "failed to parse remote memory key: " << key_str;
-            return NIXL_ERR_INVALID_PARAM;
-        }
+        // for remote metadata, get the key directly from the public metadata object
+        const nixlOfiPublicMetadata *remote_md = static_cast<const nixlOfiPublicMetadata*>(remote_desc.metadataP);
+        ofi_handle->remote_key = remote_md->getRemoteKey();
+        NIXL_DEBUG << "using remote memory key: " << ofi_handle->remote_key << " from public metadata";
     }
     ofi_handle->remote_addr = (void*)remote_desc.addr;
     ofi_handle->transfer_size = std::min(remote_desc.len, local_desc.len);

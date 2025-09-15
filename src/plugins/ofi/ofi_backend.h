@@ -100,14 +100,16 @@ class nixlOfiPrivateMetadata : public nixlBackendMD {
 
 class nixlOfiPublicMetadata : public nixlBackendMD {
 public:
-    nixlOfiPublicMetadata() : nixlBackendMD(false) {}
-
-    // placeholder for remote key handling
+    nixlOfiPublicMetadata() : nixlBackendMD(false), remote_key(0) {}
 
     ofi_connection_ptr_t conn;
+    uint64_t remote_key;  // store the parsed remote memory key
+
+    [[nodiscard]] uint64_t getRemoteKey() const noexcept {
+        return remote_key;
+    }
 
 private:
-    // placeholder for remote key storage
 };
 
 class nixlOfiEngine : public nixlBackendEngine {
