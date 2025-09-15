@@ -16,6 +16,7 @@
 subdir('ucx')
 subdir('ucx_mo')
 subdir('posix')
+subdir('ofi')
 
 
 if cuda_dep.found() and doca_gpunetio_dep.found()
