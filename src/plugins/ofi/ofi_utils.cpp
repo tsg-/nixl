@@ -18,6 +18,8 @@
 #include "ofi_utils.h"
 #include "common/nixl_log.h"
 #include <cstring>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 
 // static member definitions
 struct fi_info *nixlOfiUtils::hints = nullptr;
@@ -67,20 +69,32 @@ nixl_status_t nixlOfiUtils::setupFabric(const nixl_b_params_t& params) {
     hints->domain_attr->mr_mode = FI_MR_LOCAL | FI_MR_RAW | FI_MR_VIRT_ADDR |
                                   FI_MR_ALLOCATED | FI_MR_PROV_KEY | FI_MR_ENDPOINT;
 
-    // set provider from params
-    auto provider_it = params.find("ofi_provider");
-    if (provider_it != params.end() && !provider_it->second.empty()) {
-        hints->fabric_attr->prov_name = strdup(provider_it->second.c_str());
+    // set provider from params with default
+    std::string provider = get_param_string(params, "ofi_provider", "verbs;ofi_rxm");
+    if (!provider.empty()) {
+        hints->fabric_attr->prov_name = strdup(provider.c_str());
+        NIXL_INFO << "requesting provider: " << provider;
+    } else {
+        NIXL_INFO << "no provider specified, using libfabric default";
     }
 
     // get fabric info
     uint64_t flags = FI_SOURCE;
     ret = fi_getinfo(FI_VERSION(1, 20), nullptr, nullptr, flags, hints, &fi);
     if (ret) {
-        NIXL_ERROR << "fi_getinfo failed: " << fi_strerror(-ret);
-        fi_freeinfo(hints);
-        hints = nullptr;
-        return NIXL_ERR_BACKEND;
+        if (hints->fabric_attr->prov_name) {
+            NIXL_WARN << "requested provider '" << hints->fabric_attr->prov_name
+                      << "' not found, trying default: " << fi_strerror(-ret);
+            free(hints->fabric_attr->prov_name);
+            hints->fabric_attr->prov_name = nullptr;
+            ret = fi_getinfo(FI_VERSION(1, 20), nullptr, nullptr, flags, hints, &fi);
+        }
+        if (ret) {
+            NIXL_ERROR << "fi_getinfo failed: " << fi_strerror(-ret);
+            fi_freeinfo(hints);
+            hints = nullptr;
+            return NIXL_ERR_BACKEND;
+        }
     }
 
     NIXL_INFO << "using provider: " << fi->fabric_attr->prov_name;
@@ -265,4 +279,35 @@ int get_param_int(const nixl_b_params_t& params, const std::string& key, int def
         }
     }
     return default_value;
+}
+
+std::string get_param_string(const nixl_b_params_t& params, const std::string& key, const std::string& default_value) {
+    auto it = params.find(key);
+    if (it != params.end() && !it->second.empty()) {
+        return it->second;
+    }
+    return default_value;
+}
+
+std::string addr_to_string(const void* addr_data, size_t addr_len) {
+    if (!addr_data || addr_len < sizeof(struct sockaddr)) {
+        return "invalid";
+    }
+
+    const struct sockaddr* sa = reinterpret_cast<const struct sockaddr*>(addr_data);
+    char addr_str[INET6_ADDRSTRLEN];
+
+    if (sa->sa_family == AF_INET && addr_len >= sizeof(struct sockaddr_in)) {
+        const struct sockaddr_in* sin = reinterpret_cast<const struct sockaddr_in*>(sa);
+        if (inet_ntop(AF_INET, &sin->sin_addr, addr_str, sizeof(addr_str))) {
+            return std::string(addr_str) + ":" + std::to_string(ntohs(sin->sin_port));
+        }
+    } else if (sa->sa_family == AF_INET6 && addr_len >= sizeof(struct sockaddr_in6)) {
+        const struct sockaddr_in6* sin6 = reinterpret_cast<const struct sockaddr_in6*>(sa);
+        if (inet_ntop(AF_INET6, &sin6->sin6_addr, addr_str, sizeof(addr_str))) {
+            return "[" + std::string(addr_str) + "]:" + std::to_string(ntohs(sin6->sin6_port));
+        }
+    }
+
+    return "unknown_family_" + std::to_string(sa->sa_family);
 }

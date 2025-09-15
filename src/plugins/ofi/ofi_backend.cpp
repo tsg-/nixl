@@ -36,8 +36,15 @@ nixlOfiEngine::create(const nixlBackendInitParams &init_params) {
 
 nixlOfiEngine::nixlOfiEngine(const nixlBackendInitParams &init_params)
     : nixlBackendEngine(&init_params) {
+    // merge plugin defaults with user-provided parameters
+    nixl_b_params_t merged_params = get_ofi_backend_common_options();
+    const auto& user_params = getCustomParams();
+    for (const auto& param : user_params) {
+        merged_params[param.first] = param.second;  // user params override defaults
+    }
+
     // initialize fabric resources
-    nixl_status_t status = nixlOfiUtils::setupFabric(getCustomParams());
+    nixl_status_t status = nixlOfiUtils::setupFabric(merged_params);
     if (status != NIXL_SUCCESS) {
         NIXL_ERROR << "failed to setup OFI fabric";
         initErr = true;
@@ -118,11 +125,22 @@ nixl_status_t nixlOfiEngine::loadRemoteConnInfo(const std::string &remote_agent,
     auto conn = std::make_shared<nixlOfiConnection>();
     conn->remoteAgent = remote_agent;
 
-    // insert remote address into address vector
-    int ret = fi_av_insert(nixlOfiUtils::av, remote_conn_info.data(), 1, &conn->fi_addr, 0, nullptr);
-    if (ret != 1) {
-        NIXL_ERROR << "fi_av_insert failed: " << fi_strerror(-ret);
-        return NIXL_ERR_BACKEND;
+    // skip address insertion for empty connection info (intra-agent case)
+    if (remote_conn_info.empty()) {
+        NIXL_DEBUG << "empty remote_conn_info, skipping fi_av_insert for intra-agent setup";
+        conn->fi_addr = FI_ADDR_UNSPEC;
+    } else {
+        // remote_conn_info contains binary address data from fi_getname()
+        // insert it directly into the address vector
+        int ret = fi_av_insert(nixlOfiUtils::av, remote_conn_info.data(), 1, &conn->fi_addr, 0, nullptr);
+        if (ret != 1) {
+            NIXL_ERROR << "fi_av_insert failed: " << fi_strerror(-ret);
+            return NIXL_ERR_BACKEND;
+        }
+
+        std::string readable_addr = addr_to_string(remote_conn_info.data(), remote_conn_info.size());
+        NIXL_DEBUG << "inserted remote address into AV, fi_addr: " << conn->fi_addr
+                   << " readable: " << readable_addr;
     }
 
     // perform handshake (following server_bw.c pattern)
@@ -146,7 +164,7 @@ nixl_status_t nixlOfiEngine::loadRemoteConnInfo(const std::string &remote_agent,
     attr.context = nullptr;
     attr.iface = FI_HMEM_SYSTEM;
 
-    ret = fi_mr_regattr(nixlOfiUtils::domain, &attr, 0, &handshake_mr);
+    int ret = fi_mr_regattr(nixlOfiUtils::domain, &attr, 0, &handshake_mr);
     if (ret) {
         NIXL_ERROR << "handshake buffer registration failed: " << fi_strerror(-ret);
         return NIXL_ERR_BACKEND;

@@ -60,4 +60,9 @@ nixl_b_params_t get_ofi_backend_common_options();
 // helper function to get parameter values with defaults
 int get_param_int(const nixl_b_params_t& params, const std::string& key, int default_value);
 
+std::string get_param_string(const nixl_b_params_t& params, const std::string& key, const std::string& default_value);
+
+// convert binary address data to human-readable string
+std::string addr_to_string(const void* addr_data, size_t addr_len);
+
 #endif
