@@ -143,68 +143,13 @@ nixl_status_t nixlOfiEngine::loadRemoteConnInfo(const std::string &remote_agent,
                    << " readable: " << readable_addr;
     }
 
-    // perform handshake (following server_bw.c pattern)
-    // allocate temporary handshake buffer
-    const size_t handshake_size = 64;
-    std::vector<char> handshake_buf(handshake_size);
-
-    // register handshake buffer
-    struct fid_mr *handshake_mr = nullptr;
-    struct fi_mr_attr attr = {0};
-    struct iovec iov = {0};
-
-    iov.iov_base = handshake_buf.data();
-    iov.iov_len = handshake_size;
-
-    attr.mr_iov = &iov;
-    attr.iov_count = 1;
-    attr.access = FI_SEND | FI_RECV;
-    attr.offset = 0;
-    attr.requested_key = FI_KEY_NOTAVAIL;
-    attr.context = nullptr;
-    attr.iface = FI_HMEM_SYSTEM;
-
-    int ret = fi_mr_regattr(nixlOfiUtils::domain, &attr, 0, &handshake_mr);
-    if (ret) {
-        NIXL_ERROR << "handshake buffer registration failed: " << fi_strerror(-ret);
-        return NIXL_ERR_BACKEND;
-    }
-
-    void *handshake_desc = fi_mr_desc(handshake_mr);
-
-    // post receive for handshake (following server_bw.c pattern)
-    struct fi_context rx_ctx;
-    ret = fi_recv(nixlOfiUtils::ep, handshake_buf.data(), handshake_size,
-                  handshake_desc, conn->fi_addr, &rx_ctx);
-    if (ret) {
-        NIXL_ERROR << "fi_recv for handshake failed: " << fi_strerror(-ret);
-        fi_close(&handshake_mr->fid);
-        return NIXL_ERR_BACKEND;
-    }
-
-    // wait for handshake completion
-    struct fi_cq_err_entry comp;
-    int cq_ret;
-    do {
-        cq_ret = fi_cq_read(nixlOfiUtils::rxcq, &comp, 1);
-    } while (cq_ret == -FI_EAGAIN);
-
-    if (cq_ret < 0) {
-        NIXL_ERROR << "handshake completion failed: " << fi_strerror(-cq_ret);
-        fi_close(&handshake_mr->fid);
-        return NIXL_ERR_BACKEND;
-    }
-
-    // cleanup handshake buffer
-    fi_close(&handshake_mr->fid);
-
-    // mark handshake as complete
+    // mark connection as ready (no handshake needed for RMA)
     conn->handshake_complete = true;
 
     // store connection
     remoteConnMap.insert({remote_agent, conn});
 
-    NIXL_DEBUG << "completed handshake and loaded connection info for agent: " << remote_agent;
+    NIXL_DEBUG << "loaded connection info for agent: " << remote_agent;
     return NIXL_SUCCESS;
 }
 
@@ -227,11 +172,11 @@ nixl_status_t nixlOfiEngine::registerMem(const nixlBlobDesc &mem,
 
     attr.mr_iov = &iov;
     attr.iov_count = 1;
-    attr.access = FI_SEND | FI_RECV | FI_READ | FI_WRITE | FI_REMOTE_READ | FI_REMOTE_WRITE;
+    attr.access = FI_MR_RMA_EVENT | FI_MR_HMEM | FI_MR_COLLECTIVE; // exact match with server_bw.c
     attr.offset = 0;
-    attr.requested_key = FI_KEY_NOTAVAIL;  // let provider choose key
+    attr.requested_key = 1; // FT_MR_KEY from server_bw.c
     attr.context = nullptr;
-    attr.iface = FI_HMEM_SYSTEM;  // default to system memory
+    attr.iface = FI_HMEM_SYSTEM; // opts.iface from server_bw.c
 
     // register memory region
     int ret = fi_mr_regattr(nixlOfiUtils::domain, &attr, 0, &priv->mr);
@@ -299,8 +244,25 @@ nixl_status_t nixlOfiEngine::loadRemoteMD(const nixlBlobDesc &input,
                                           const nixl_mem_t &nixl_mem,
                                           const std::string &remote_agent,
                                           nixlBackendMD* &output) {
-    // placeholder implementation
-    return NIXL_ERR_NOT_SUPPORTED;
+    // create remote metadata object
+    auto remote_md = std::make_unique<nixlOfiPublicMetadata>();
+
+    // get connection for this remote agent
+    auto conn = getConnection(remote_agent);
+    if (!conn) {
+        NIXL_ERROR << "no connection found for remote agent: " << remote_agent;
+        return NIXL_ERR_NOT_FOUND;
+    }
+
+    // store connection reference in metadata
+    remote_md->conn = conn;
+
+    NIXL_DEBUG << "loaded remote metadata for agent: " << remote_agent
+               << " memory: " << std::hex << input.addr
+               << " size: " << input.len;
+
+    output = remote_md.release();
+    return NIXL_SUCCESS;
 }
 
 nixl_status_t nixlOfiEngine::unloadMD(nixlBackendMD* input) {
