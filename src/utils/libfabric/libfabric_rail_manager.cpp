@@ -42,7 +42,7 @@ nixlLibfabricRailManager::nixlLibfabricRailManager(size_t striping_threshold)
     }
 
     // Get EFA devices from topology and create rails automatically
-    std::vector<std::string> all_efa_devices = topology->getAllEfaDevices();
+    std::vector<std::string> all_efa_devices = topology->getAllLibfabricDevices();
     NIXL_DEBUG << "Got " << all_efa_devices.size() << " EFA devices from topology";
 
     // Create data rails
@@ -66,31 +66,46 @@ nixlLibfabricRailManager::~nixlLibfabricRailManager() {
 
 nixl_status_t
 nixlLibfabricRailManager::createDataRails(const std::vector<std::string> &efa_devices) {
-    num_data_rails_ = efa_devices.size();
+    // Limit the number of data rails to prevent resource exhaustion
+    size_t max_data_rails = std::min(static_cast<size_t>(NIXL_LIBFABRIC_DEFAULT_DATA_RAILS), efa_devices.size());
+    num_data_rails_ = max_data_rails;
+
     // Pre-allocate to ensure contiguous memory allocation
     data_rails_.reserve(num_data_rails_);
 
     // Build EFA device to rail index mapping for O(1) lookup
     efa_device_to_rail_map.reserve(num_data_rails_);
 
-    try {
-        data_rails_.clear();
-        data_rails_.reserve(num_data_rails_);
+    NIXL_DEBUG << "Attempting to create up to " << num_data_rails_ << " data rails from " << efa_devices.size() << " available devices (limited by NIXL_LIBFABRIC_DEFAULT_DATA_RAILS=" << NIXL_LIBFABRIC_DEFAULT_DATA_RAILS << ")";
+    data_rails_.clear();
+    data_rails_.reserve(num_data_rails_);
 
-        for (size_t i = 0; i < num_data_rails_; ++i) {
-            data_rails_.emplace_back(
-                std::make_unique<nixlLibfabricRail>(efa_devices[i], static_cast<uint16_t>(i)));
+    size_t successful_rails = 0;
+    for (size_t i = 0; i < num_data_rails_ && i < efa_devices.size(); ++i) {
+        try {
+            auto rail = std::make_unique<nixlLibfabricRail>(efa_devices[i], static_cast<uint16_t>(successful_rails));
 
-            // Initialize EFA device mapping
-            efa_device_to_rail_map[efa_devices[i]] = i;
+            // Initialize device mapping using successful rail index
+            efa_device_to_rail_map[efa_devices[i]] = successful_rails;
+            data_rails_.emplace_back(std::move(rail));
 
-            NIXL_DEBUG << "Created data rail " << i << " (device: " << efa_devices[i] << ")";
+            NIXL_DEBUG << "Created data rail " << successful_rails << " (device: " << efa_devices[i] << ")";
+            successful_rails++;
+        }
+        catch (const std::exception &e) {
+            NIXL_WARN << "Failed to create rail for device " << efa_devices[i] << ": " << e.what() << " (trying next device)";
+            // Continue trying other devices
         }
     }
-    catch (const std::exception &e) {
-        NIXL_ERROR << "Failed to create data rails: " << e.what();
+
+    if (successful_rails == 0) {
+        NIXL_ERROR << "Failed to create any data rails from " << efa_devices.size() << " available devices";
         return NIXL_ERR_BACKEND;
     }
+
+    NIXL_DEBUG << "Successfully created " << successful_rails << " data rails";
+    // Update the actual number of rails created
+    num_data_rails_ = successful_rails;
     return NIXL_SUCCESS;
 }
 
@@ -101,20 +116,33 @@ nixlLibfabricRailManager::createControlRails(const std::vector<std::string> &efa
     num_control_rails_ = num_control_rails;
     control_rails_.reserve(num_control_rails_);
 
-    try {
-        control_rails_.clear();
-        control_rails_.reserve(num_control_rails_);
+    NIXL_DEBUG << "Attempting to create up to " << num_control_rails_ << " control rails";
+    control_rails_.clear();
+    control_rails_.reserve(num_control_rails_);
 
-        for (size_t i = 0; i < num_control_rails_; ++i) {
-            control_rails_.emplace_back(
-                std::make_unique<nixlLibfabricRail>(efa_devices[i], static_cast<uint16_t>(i)));
-            NIXL_DEBUG << "Created control rail " << i << " (device: " << efa_devices[i] << ")";
+    size_t successful_control_rails = 0;
+    for (size_t i = 0; i < num_control_rails_ && i < efa_devices.size(); ++i) {
+        try {
+            auto rail = std::make_unique<nixlLibfabricRail>(efa_devices[i], static_cast<uint16_t>(successful_control_rails));
+            control_rails_.emplace_back(std::move(rail));
+
+            NIXL_DEBUG << "Created control rail " << successful_control_rails << " (device: " << efa_devices[i] << ")";
+            successful_control_rails++;
+        }
+        catch (const std::exception &e) {
+            NIXL_WARN << "Failed to create control rail for device " << efa_devices[i] << ": " << e.what() << " (trying next device)";
+            // Continue trying other devices
         }
     }
-    catch (const std::exception &e) {
-        NIXL_ERROR << "Failed to create control rails: " << e.what();
+
+    if (successful_control_rails == 0) {
+        NIXL_ERROR << "Failed to create any control rails from " << efa_devices.size() << " available devices";
         return NIXL_ERR_BACKEND;
     }
+
+    NIXL_DEBUG << "Successfully created " << successful_control_rails << " control rails";
+    // Update the actual number of control rails created
+    num_control_rails_ = successful_control_rails;
     return NIXL_SUCCESS;
 }
 
@@ -274,7 +302,7 @@ nixlLibfabricRailManager::selectRailsForMemory(void *mem_addr, nixl_mem_t mem_ty
             NIXL_ERROR << "Could not detect GPU for VRAM memory " << mem_addr;
             return {}; // Return empty vector to indicate failure
         }
-        std::vector<std::string> gpu_efa_devices = topology->getEfaDevicesForGpu(gpu_id);
+        std::vector<std::string> gpu_efa_devices = topology->getLibfabricDevicesForGpu(gpu_id);
         if (gpu_efa_devices.empty()) {
             NIXL_ERROR << "No EFA devices found for GPU " << gpu_id;
             return {}; // Return empty vector to indicate failure
@@ -319,7 +347,7 @@ nixlLibfabricRailManager::selectRailsForMemory(void *mem_addr, nixl_mem_t mem_ty
             NIXL_ERROR << "Could not detect NUMA node for DRAM memory " << mem_addr;
             return {};
         }
-        std::vector<std::string> numa_efa_devices = topology->getEfaDevicesForNumaNode(numa_node);
+        std::vector<std::string> numa_efa_devices = topology->getLibfabricDevicesForNumaNode(numa_node);
         if (numa_efa_devices.empty()) {
             NIXL_ERROR << "No EFA devices found for NUMA node " << numa_node;
             return {};

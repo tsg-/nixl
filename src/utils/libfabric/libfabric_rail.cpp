@@ -219,7 +219,28 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device, uint16_t id)
     hints->domain_attr->mr_mode =
         FI_MR_LOCAL | FI_MR_HMEM | FI_MR_VIRT_ADDR | FI_MR_ALLOCATED | FI_MR_PROV_KEY;
     hints->domain_attr->mr_key_size = 2;
-    hints->domain_attr->name = strdup(device_name.c_str());
+    // Parse device name: handle formats like "provider:domain", "provider;util:domain", etc.
+    std::string provider_name;
+    std::string domain_name;
+    size_t colon_pos = device_name.find(':');
+    if (colon_pos != std::string::npos) {
+        provider_name = device_name.substr(0, colon_pos);
+        domain_name = device_name.substr(colon_pos + 1);
+
+        // handle complex provider names like "verbs;ofi_rxm" - use primary provider
+        size_t semicolon_pos = provider_name.find(';');
+        if (semicolon_pos != std::string::npos) {
+            provider_name = provider_name.substr(0, semicolon_pos);
+        }
+
+        hints->fabric_attr->prov_name = strdup(provider_name.c_str());
+        NIXL_DEBUG << "Rail " << rail_id << " using provider: " << provider_name << ", domain: " << domain_name;
+    } else {
+        domain_name = device_name;
+        NIXL_DEBUG << "Rail " << rail_id << " using domain: " << domain_name << " (any provider)";
+    }
+
+    hints->domain_attr->name = strdup(domain_name.c_str());
     hints->domain_attr->threading = FI_THREAD_SAFE;
     try {
         // Get fabric info for this specific device
@@ -433,7 +454,7 @@ nixlLibfabricRail::cleanup() {
     }
     // STEP 6: Free info structure
     if (info) {
-        NIXL_INFO << "Freeing info structure for rail " << rail_id;
+        // NIXL_INFO << "Freeing info structure for rail " << rail_id;
         fi_freeinfo(info);
         info = nullptr;
     }
@@ -790,9 +811,35 @@ nixlLibfabricRail::postRecv(nixlLibfabricReq *req) const {
     NIXL_TRACE << "Posting receive on endpoint: " << endpoint << " buffer: " << req->buffer
                << " size: " << req->buffer_size << " context: " << &req->ctx;
 
-    int ret = fi_recvmsg(endpoint, &msg, 0);
-    if (ret) {
-        NIXL_ERROR << "fi_recvmsg failed on rail " << rail_id << ": " << fi_strerror(-ret);
+    // retry fi_recvmsg with progress driving for EAGAIN
+    const int max_retries = 1000;
+    int retry_count = 0;
+    int ret;
+
+    while (retry_count < max_retries) {
+        ret = fi_recvmsg(endpoint, &msg, 0);
+
+        if (ret == 0) {
+            break; // success
+        }
+
+        if (ret != -FI_EAGAIN) {
+            NIXL_ERROR << "fi_recvmsg failed on rail " << rail_id << ": " << fi_strerror(-ret);
+            return NIXL_ERR_BACKEND;
+        }
+
+        // handle EAGAIN by driving progress
+        NIXL_TRACE << "fi_recvmsg returned EAGAIN on rail " << rail_id << ", retry " << retry_count;
+
+        // drive progress on completion queue
+        fi_cq_sread(cq, nullptr, 0, nullptr, 10); // 10ms timeout
+
+        retry_count++;
+        usleep(1000); // 1ms backoff
+    }
+
+    if (retry_count >= max_retries) {
+        NIXL_ERROR << "fi_recvmsg exceeded max retries (" << max_retries << ") on rail " << rail_id;
         return NIXL_ERR_BACKEND;
     }
 
@@ -821,10 +868,36 @@ nixlLibfabricRail::postSend(uint64_t immediate_data,
                << " dest_addr: " << dest_addr << std::dec << " context: " << &req->ctx;
 
     // Libfabric fi_senddata call
-    int ret = fi_senddata(
-        endpoint, req->buffer, req->buffer_size, desc, immediate_data, dest_addr, &req->ctx);
-    if (ret) {
-        NIXL_ERROR << "fi_senddata failed on rail " << rail_id << ": " << fi_strerror(-ret);
+    // retry fi_senddata with progress driving for EAGAIN
+    const int max_retries = 1000;
+    int retry_count = 0;
+    int ret;
+
+    while (retry_count < max_retries) {
+        ret = fi_senddata(
+            endpoint, req->buffer, req->buffer_size, desc, immediate_data, dest_addr, &req->ctx);
+
+        if (ret == 0) {
+            break; // success
+        }
+
+        if (ret != -FI_EAGAIN) {
+            NIXL_ERROR << "fi_senddata failed on rail " << rail_id << ": " << fi_strerror(-ret);
+            return NIXL_ERR_BACKEND;
+        }
+
+        // handle EAGAIN by driving progress
+        NIXL_TRACE << "fi_senddata returned EAGAIN on rail " << rail_id << ", retry " << retry_count;
+
+        // drive progress on completion queue
+        fi_cq_sread(cq, nullptr, 0, nullptr, 10); // 10ms timeout
+
+        retry_count++;
+        usleep(1000); // 1ms backoff
+    }
+
+    if (retry_count >= max_retries) {
+        NIXL_ERROR << "fi_senddata exceeded max retries (" << max_retries << ") on rail " << rail_id;
         return NIXL_ERR_BACKEND;
     }
     NIXL_TRACE << "Send posted successfully";
@@ -853,8 +926,13 @@ nixlLibfabricRail::postWrite(const void *local_buffer,
                << " remote_addr: " << (void *)remote_addr << " remote_key: " << remote_key
                << " context: " << &req->ctx;
 
-    // Libfabric fi_writedata call
-    int ret = fi_writedata(endpoint,
+    // retry fi_writedata with progress driving for EAGAIN
+    const int max_retries = 1000;
+    int retry_count = 0;
+    int ret;
+
+    while (retry_count < max_retries) {
+        ret = fi_writedata(endpoint,
                            local_buffer,
                            length,
                            local_desc,
@@ -864,8 +942,27 @@ nixlLibfabricRail::postWrite(const void *local_buffer,
                            remote_key,
                            &req->ctx);
 
-    if (ret) {
-        NIXL_ERROR << "fi_writedata failed on rail " << rail_id << ": " << fi_strerror(-ret);
+        if (ret == 0) {
+            break; // success
+        }
+
+        if (ret != -FI_EAGAIN) {
+            NIXL_ERROR << "fi_writedata failed on rail " << rail_id << ": " << fi_strerror(-ret);
+            return NIXL_ERR_BACKEND;
+        }
+
+        // handle EAGAIN by driving progress
+        NIXL_TRACE << "fi_writedata returned EAGAIN on rail " << rail_id << ", retry " << retry_count;
+
+        // drive progress on completion queue
+        fi_cq_sread(cq, nullptr, 0, nullptr, 10); // 10ms timeout
+
+        retry_count++;
+        usleep(1000); // 1ms backoff
+    }
+
+    if (retry_count >= max_retries) {
+        NIXL_ERROR << "fi_writedata exceeded max retries (" << max_retries << ") on rail " << rail_id;
         return NIXL_ERR_BACKEND;
     }
     NIXL_TRACE << "RDMA write posted successfully";
@@ -890,10 +987,35 @@ nixlLibfabricRail::postRead(void *local_buffer,
                << " dest_addr: " << dest_addr << " remote_addr: " << (void *)remote_addr
                << " remote_key: " << remote_key << " context: " << &req->ctx;
 
-    int ret = fi_read(
-        endpoint, local_buffer, length, local_desc, dest_addr, remote_addr, remote_key, &req->ctx);
-    if (ret) {
-        NIXL_ERROR << "fi_read failed on rail " << rail_id << ": " << fi_strerror(-ret);
+    // retry fi_read with progress driving for EAGAIN
+    const int max_retries = 1000;
+    int retry_count = 0;
+    int ret;
+
+    while (retry_count < max_retries) {
+        ret = fi_read(endpoint, local_buffer, length, local_desc, dest_addr, remote_addr, remote_key, &req->ctx);
+
+        if (ret == 0) {
+            break; // success
+        }
+
+        if (ret != -FI_EAGAIN) {
+            NIXL_ERROR << "fi_read failed on rail " << rail_id << ": " << fi_strerror(-ret);
+            return NIXL_ERR_BACKEND;
+        }
+
+        // handle EAGAIN by driving progress
+        NIXL_TRACE << "fi_read returned EAGAIN on rail " << rail_id << ", retry " << retry_count;
+
+        // drive progress on completion queue
+        fi_cq_sread(cq, nullptr, 0, nullptr, 10); // 10ms timeout
+
+        retry_count++;
+        usleep(1000); // 1ms backoff
+    }
+
+    if (retry_count >= max_retries) {
+        NIXL_ERROR << "fi_read exceeded max retries (" << max_retries << ") on rail " << rail_id;
         return NIXL_ERR_BACKEND;
     }
     NIXL_TRACE << "RDMA read posted successfully";
@@ -1012,7 +1134,12 @@ nixlLibfabricRail::getMemoryKey(struct fid_mr *mr) const {
 
 nixlLibfabricReq *
 nixlLibfabricRail::allocateControlRequest(size_t needed_size) {
-    return control_request_pool_.allocate(needed_size);
+    nixlLibfabricReq *req = control_request_pool_.allocate(needed_size);
+    if (!req) {
+        NIXL_ERROR << "Failed to allocate control request of size " << needed_size
+                   << " on rail " << rail_id << " - control pool exhausted";
+    }
+    return req;
 }
 
 nixlLibfabricReq *

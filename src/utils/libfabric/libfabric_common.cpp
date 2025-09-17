@@ -30,6 +30,11 @@ namespace LibfabricUtils {
 
 std::vector<std::string>
 getAvailableEfaDevices() {
+    return getAvailableLibfabricDevices("efa");
+}
+
+std::vector<std::string>
+getAvailableLibfabricDevices(const char* provider_name) {
     std::vector<std::string> devices;
     struct fi_info *hints, *info;
     hints = fi_allocinfo();
@@ -38,22 +43,54 @@ getAvailableEfaDevices() {
         return devices;
     }
 
-    hints->fabric_attr->prov_name = strdup("efa");
+    // Check for FI_PROVIDER environment variable first
+    const char* env_provider = getenv("FI_PROVIDER");
+    const char* actual_provider = provider_name;
+
+    if (env_provider && strlen(env_provider) > 0) {
+        actual_provider = env_provider;
+        NIXL_DEBUG << "Using FI_PROVIDER environment variable: " << env_provider;
+        if (provider_name && strcmp(provider_name, env_provider) != 0) {
+            NIXL_DEBUG << "Note: FI_PROVIDER (" << env_provider << ") overrides requested provider (" << provider_name << ")";
+        }
+    }
+
+    // Set provider name if specified, otherwise discover all providers
+    if (actual_provider) {
+        hints->fabric_attr->prov_name = strdup(actual_provider);
+        NIXL_DEBUG << "Discovering devices for provider: " << actual_provider;
+    } else {
+        NIXL_DEBUG << "Discovering devices for all providers";
+    }
+
     int ret = fi_getinfo(FI_VERSION(1, 9), NULL, NULL, 0, hints, &info);
     if (ret) {
-        NIXL_ERROR << "fi_getinfo failed during device discovery: " << fi_strerror(-ret);
+        NIXL_DEBUG << "fi_getinfo failed during device discovery for provider "
+                  << (actual_provider ? actual_provider : "all") << ": " << fi_strerror(-ret);
         fi_freeinfo(hints);
         return devices;
     }
 
     for (struct fi_info *cur = info; cur; cur = cur->next) {
         if (cur->domain_attr && cur->domain_attr->name) {
-            devices.push_back(cur->domain_attr->name);
+            std::string device_name = cur->domain_attr->name;
+            std::string prov_name = cur->fabric_attr->prov_name ? cur->fabric_attr->prov_name : "unknown";
+
+            // Add provider prefix to device name for non-EFA devices
+            if (prov_name != "efa") {
+                device_name = prov_name + ":" + device_name;
+            }
+
+            devices.push_back(device_name);
+            NIXL_DEBUG << "Found device: " << device_name << " (provider: " << prov_name << ")";
         }
     }
 
     fi_freeinfo(info);
     fi_freeinfo(hints);
+
+    NIXL_DEBUG << "Discovered " << devices.size() << " devices for provider "
+               << (actual_provider ? actual_provider : "all");
     return devices;
 }
 

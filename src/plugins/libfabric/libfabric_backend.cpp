@@ -24,6 +24,8 @@
 #include <limits>
 #include <cstring>
 #include <unistd.h>
+#include <thread>
+#include <chrono>
 
 #include <iomanip>
 #include <numeric>
@@ -1019,12 +1021,29 @@ nixlLibfabricEngine::postXfer(const nixl_xfer_op_t &operation,
         return NIXL_ERR_INVALID_PARAM;
     }
 
-    // Allocate a new notification request at the start of each postXfer
+    // allocate notification request at start of postXfer
     const size_t control_rail_id = 0;
-    nixlLibfabricReq *control_request = rail_manager.getControlRail(control_rail_id)
-                                            .allocateControlRequest(sizeof(BinaryNotification));
+    nixlLibfabricReq *control_request = nullptr;
+
+    // retry control request allocation with progress driving
+    const int max_retries = 10;
+    for (int retry = 0; retry < max_retries; ++retry) {
+        control_request = rail_manager.getControlRail(control_rail_id)
+                             .allocateControlRequest(sizeof(BinaryNotification));
+        if (control_request) {
+            break; // successfully allocated
+        }
+
+        // drive progress to release completed requests
+        NIXL_DEBUG << "Control request allocation failed, driving progress (retry " << retry + 1 << "/" << max_retries << ")";
+        rail_manager.progressAllControlRails();
+
+        // brief delay for completion processing
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+
     if (!control_request) {
-        NIXL_ERROR << "Failed to allocate control request for notification";
+        NIXL_ERROR << "Failed to allocate control request for notification after " << max_retries << " retries";
         return NIXL_ERR_BACKEND;
     }
 

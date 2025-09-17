@@ -24,26 +24,26 @@
 #include <map>
 
 /**
- * @brief Topology discovery and management for AWS instances with EFA devices
+ * @brief Topology discovery and management for libfabric devices (EFA, verbs, sockets, etc.)
  *
- * Automatically discovers system topology using hwloc and maps GPUs to EFA devices
- * based on PCIe proximity for optimal performance. Hard errors if topology discovery fails.
+ * Automatically discovers system topology using hwloc and maps GPUs to libfabric devices
+ * based on PCIe proximity for optimal performance. Falls back gracefully for non-EFA devices.
  */
 class nixlLibfabricTopology {
 private:
-    // GPU to EFA device mapping: GPU 0→[efa0,efa1], GPU 1→[efa2,efa3], etc.
-    std::map<int, std::vector<std::string>> gpu_to_efa_devices;
+    // GPU to libfabric device mapping: GPU 0→[efa0,efa1], GPU 1→[efa2,efa3], etc.
+    std::map<int, std::vector<std::string>> gpu_to_libfabric_devices;
 
-    // NUMA to EFA device mapping: NUMA 0→[efa0-7], NUMA 1→[efa8-15]
-    std::map<int, std::vector<std::string>> numa_to_efa_devices;
+    // NUMA to libfabric device mapping: NUMA 0→[efa0-7], NUMA 1→[efa8-15]
+    std::map<int, std::vector<std::string>> numa_to_libfabric_devices;
 
-    // All available EFA devices discovered on this system
-    std::vector<std::string> all_efa_devices;
+    // All available libfabric devices discovered on this system
+    std::vector<std::string> all_libfabric_devices;
 
     // System information
     int num_gpus;
     int num_numa_nodes;
-    int num_efa_devices;
+    int num_libfabric_devices;
 
     // Discovery state
     bool topology_discovered;
@@ -57,7 +57,7 @@ private:
 
     // Helper methods
     nixl_status_t
-    discoverEfaDevices();
+    discoverLibfabricDevices();
     nixl_status_t
     discoverTopology();
 
@@ -71,9 +71,9 @@ private:
     nixl_status_t
     discoverGpusWithHwloc();
     nixl_status_t
-    discoverEfaDevicesWithHwloc();
+    discoverLibfabricDevicesWithHwloc();
     nixl_status_t
-    buildGpuToEfaMapping();
+    buildGpuToLibfabricMapping();
     void
     cleanupHwlocTopology();
 
@@ -127,14 +127,18 @@ public:
     ~nixlLibfabricTopology();
     // GPU-based queries
     std::vector<std::string>
-    getEfaDevicesForGpu(int gpu_id) const;
+    getLibfabricDevicesForGpu(int gpu_id) const;
+    std::vector<std::string>
+    getEfaDevicesForGpu(int gpu_id) const; // backward compatibility
     int
     detectGpuIdForMemory(void *mem_addr) const;
     bool
     isGpuMemory(void *mem_addr) const;
     // NUMA-based queries
     std::vector<std::string>
-    getEfaDevicesForNumaNode(int numa_node) const;
+    getLibfabricDevicesForNumaNode(int numa_node) const;
+    std::vector<std::string>
+    getEfaDevicesForNumaNode(int numa_node) const; // backward compatibility
     int
     detectNumaNodeForMemory(void *mem_addr) const;
     bool
@@ -142,7 +146,9 @@ public:
 
     // Memory-based queries (main interface)
     std::vector<std::string>
-    getEfaDevicesForMemory(void *mem_addr, nixl_mem_t mem_type) const;
+    getLibfabricDevicesForMemory(void *mem_addr, nixl_mem_t mem_type) const;
+    std::vector<std::string>
+    getEfaDevicesForMemory(void *mem_addr, nixl_mem_t mem_type) const; // backward compatibility
 
     // System information
     int
@@ -156,8 +162,13 @@ public:
     }
 
     const std::vector<std::string> &
-    getAllEfaDevices() const {
-        return all_efa_devices;
+    getAllLibfabricDevices() const {
+        return all_libfabric_devices;
+    }
+
+    const std::vector<std::string> &
+    getAllEfaDevices() const { // backward compatibility
+        return all_libfabric_devices;
     }
 
     // Validation
@@ -171,7 +182,9 @@ public:
     bool
     isValidNumaNode(int numa_node) const;
     bool
-    isValidEfaDevice(const std::string &efa_device) const;
+    isValidLibfabricDevice(const std::string &device) const;
+    bool
+    isValidEfaDevice(const std::string &efa_device) const; // backward compatibility
     // Debug/info
     void
     printTopologyInfo() const;

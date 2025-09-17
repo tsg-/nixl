@@ -33,6 +33,7 @@
 
 // Libfabric configuration constants
 #define NIXL_LIBFABRIC_DEFAULT_CONTROL_RAILS 1
+#define NIXL_LIBFABRIC_DEFAULT_DATA_RAILS 2  // reasonable default with retry mechanism
 #define NIXL_LIBFABRIC_SEND_RECV_BUFFER_SIZE 8192
 #define NIXL_LIBFABRIC_CQ_SREAD_TIMEOUT_SEC 1
 #define NIXL_LIBFABRIC_DEFAULT_STRIPING_THRESHOLD (128 * 1024) // 128KB
@@ -153,6 +154,8 @@ namespace LibfabricUtils {
 // Device discovery
 std::vector<std::string>
 getAvailableEfaDevices();
+std::vector<std::string>
+getAvailableLibfabricDevices(const char* provider_name = nullptr);
 // String utilities
 std::string
 hexdump(const void *data);
