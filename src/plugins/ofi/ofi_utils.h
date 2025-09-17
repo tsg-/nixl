@@ -68,7 +68,38 @@ bool get_param_bool(const nixl_b_params_t& params, const std::string& key, bool 
 std::string addr_to_string(const void* addr_data, size_t addr_len);
 
 // Manual progress driving for FI_PROGRESS_MANUAL providers
+void simple_progress();
 void drive_manual_progress();
+
+// progress function similar to fabtests ft_progress
+int ofi_progress(struct fid_cq *cq);
+
+// reliable post macro adapted from fabtests
+#define OFI_POST(post_fn, cq, op_str, ...)                               \
+    do {                                                                  \
+        int ret;                                                          \
+        int retry_count = 0;                                              \
+        const int max_retries = 1000;                                     \
+                                                                          \
+        while (1) {                                                       \
+            ret = post_fn(__VA_ARGS__);                                   \
+            if (!ret)                                                     \
+                break;                                                    \
+                                                                          \
+            if (ret != -FI_EAGAIN) {                                      \
+                NIXL_ERROR << op_str << " failed: " << fi_strerror(-ret); \
+                return NIXL_ERR_BACKEND;                                  \
+            }                                                             \
+                                                                          \
+            if (++retry_count >= max_retries) {                          \
+                NIXL_ERROR << op_str << " exceeded max retries";         \
+                return NIXL_ERR_BACKEND;                                  \
+            }                                                             \
+                                                                          \
+            ofi_progress(cq);                                             \
+            usleep(1000);                                                 \
+        }                                                                 \
+    } while (0)
 
 // Helper function to validate that the selected provider meets all requirements
 void validate_provider_capabilities(struct fi_info* hints, struct fi_info* result);

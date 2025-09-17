@@ -19,6 +19,7 @@
 #include "common/nixl_log.h"
 #include <cstring>
 #include <algorithm>
+#include <string>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 
@@ -49,10 +50,6 @@ nixl_status_t nixlOfiUtils::setupFabric(const nixl_b_params_t& params) {
         return NIXL_SUCCESS;
     }
 
-    // enable libfabric debug logging before any fi_ calls
-    setenv("FI_LOG_LEVEL", "debug", 0);  // don't overwrite if already set
-    setenv("FI_LOG_PROV", "verbs", 0);
-
     NIXL_INFO << "setting up ofi fabric";
     int ret;
 
@@ -63,23 +60,24 @@ nixl_status_t nixlOfiUtils::setupFabric(const nixl_b_params_t& params) {
         return NIXL_ERR_BACKEND;
     }
 
-    // use exact "verbs" configuration from SUPPORTED_PROVIDERS in ofi_utils_save.cpp
-    hints->caps = FI_MSG | FI_RMA | FI_READ | FI_RECV | FI_SEND | FI_REMOTE_READ | FI_MULTI_RECV | FI_LOCAL_COMM | FI_REMOTE_COMM;
+    hints->caps = FI_MSG | FI_RMA | FI_READ | FI_REMOTE_READ; 
     hints->mode = 0;
-    hints->addr_format = FI_SOCKADDR_IN;
+    hints->addr_format = FI_FORMAT_UNSPEC;
+    hints->tx_attr->tclass = 0x203;
     hints->ep_attr->type = FI_EP_RDM;
     hints->domain_attr->threading = FI_THREAD_SAFE;
-    hints->domain_attr->control_progress = FI_PROGRESS_AUTO;
-    hints->domain_attr->data_progress = FI_PROGRESS_MANUAL;
+    hints->domain_attr->control_progress = FI_PROGRESS_UNSPEC;
+    hints->domain_attr->data_progress = FI_PROGRESS_UNSPEC;
     hints->domain_attr->resource_mgmt = FI_RM_ENABLED;
+
     hints->domain_attr->mr_mode = FI_MR_LOCAL | FI_MR_VIRT_ADDR | FI_MR_ALLOCATED | FI_MR_PROV_KEY;
 
     // set tx/rx attributes to enable completions as per verbs config
-    hints->tx_attr->op_flags = FI_COMPLETION;
-    hints->rx_attr->op_flags = FI_COMPLETION;
+    // hints->tx_attr->op_flags = FI_COMPLETION;
+    // hints->rx_attr->op_flags = FI_COMPLETION;
 
     // set provider from params with default
-    std::string provider = get_param_string(params, "ofi_provider", "verbs;ofi_rxm");
+    std::string provider = get_param_string(params, "ofi_provider", "verbs");
     if (!provider.empty()) {
         hints->fabric_attr->prov_name = strdup(provider.c_str());
         NIXL_INFO << "requesting provider: " << provider;
@@ -93,7 +91,7 @@ nixl_status_t nixlOfiUtils::setupFabric(const nixl_b_params_t& params) {
     if (ret) {
         if (hints->fabric_attr->prov_name) {
             NIXL_WARN << "requested provider '" << hints->fabric_attr->prov_name
-                      << "' not found, trying default: " << fi_strerror(-ret);
+                      << "' not found: " << fi_strerror(-ret) << ". trying defaults";
             free(hints->fabric_attr->prov_name);
             hints->fabric_attr->prov_name = nullptr;
             ret = fi_getinfo(FI_VERSION(1, 20), nullptr, nullptr, flags, hints, &fi);
@@ -383,40 +381,72 @@ std::string addr_to_string(const void* addr_data, size_t addr_len) {
     return "unknown_family_" + std::to_string(sa->sa_family);
 }
 
+int ofi_progress(struct fid_cq *cq) {
+    if (!nixlOfiUtils::fabric_initialized) {
+        return 0;
+    }
+
+    struct fi_cq_err_entry comp;
+    int ret = fi_cq_read(cq, &comp, 1);
+
+    if (ret >= 0 || ret == -FI_EAGAIN) {
+        return 0;
+    }
+
+    if (ret == -FI_EAVAIL) {
+        struct fi_cq_err_entry err;
+        fi_cq_readerr(cq, &err, 0);
+        NIXL_ERROR << "CQ error: " << fi_strerror(err.err);
+        return -1;
+    }
+
+    NIXL_ERROR << "fi_cq_read failed: " << fi_strerror(-ret);
+    return -1;
+}
+
+void simple_progress() {
+    fi_cq_read(nixlOfiUtils::rxcq, nullptr, 0);
+    fi_cq_read(nixlOfiUtils::txcq, nullptr, 0);
+}
+
 void drive_manual_progress() {
     if (!nixlOfiUtils::fabric_initialized) {
         return;
     }
 
-    // drive progress on all completion queues to advance RMA operations
-    // critical for FI_PROGRESS_MANUAL providers like verbs;ofi_rxm
-
+#if 0
+    // drive completion queues and connection management progress
     if (nixlOfiUtils::txcq) {
-        // drive TX progress - RMA operations post to TX queue
-        // use larger batch size for better progress
         struct fi_cq_entry comp[16];
         int ret = fi_cq_read(nixlOfiUtils::txcq, comp, 16);
         if (ret > 0) {
-            NIXL_DEBUG << "[MANUAL_PROGRESS] processed " << ret << " TX completions";
+            NIXL_INFO << "[MANUAL_PROGRESS] processed " << ret << " TX completions";
         } else if (ret == -FI_EAVAIL) {
-            // handle CQ errors but continue driving progress
             struct fi_cq_err_entry err;
             fi_cq_readerr(nixlOfiUtils::txcq, &err, 0);
-            NIXL_DEBUG << "[MANUAL_PROGRESS] TX CQ error: " << fi_strerror(err.err);
+            NIXL_INFO << "[MANUAL_PROGRESS] TX CQ error: " << fi_strerror(err.err);
         }
     }
 
     if (nixlOfiUtils::rxcq) {
-        // drive RX progress - may be needed for some providers
         struct fi_cq_entry comp[16];
         int ret = fi_cq_read(nixlOfiUtils::rxcq, comp, 16);
         if (ret > 0) {
-            NIXL_DEBUG << "[MANUAL_PROGRESS] processed " << ret << " RX completions";
+            NIXL_INFO << "[MANUAL_PROGRESS] processed " << ret << " RX completions";
         } else if (ret == -FI_EAVAIL) {
             struct fi_cq_err_entry err;
             fi_cq_readerr(nixlOfiUtils::rxcq, &err, 0);
-            NIXL_DEBUG << "[MANUAL_PROGRESS] RX CQ error: " << fi_strerror(err.err);
+            NIXL_INFO << "[MANUAL_PROGRESS] RX CQ error: " << fi_strerror(err.err);
         }
+    }
+#endif
+
+    // drive connection management progress for rxm
+    if (nixlOfiUtils::txcq) {
+        ofi_progress(nixlOfiUtils::txcq);
+    }
+    if (nixlOfiUtils::rxcq) {
+        ofi_progress(nixlOfiUtils::rxcq);
     }
 }
 

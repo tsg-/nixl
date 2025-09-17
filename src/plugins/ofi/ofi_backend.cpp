@@ -394,30 +394,21 @@ nixlOfiEngine::postXfer(const nixl_xfer_op_t &operation,
     int ret;
     switch (ofi_handle->operation) {
     case NIXL_READ:
-        // fi_read: read from remote memory into local buffer
-        ret = fi_read(nixlOfiUtils::ep, local_addr, ofi_handle->transfer_size, mr_desc,
-                      ofi_handle->remote_fi_addr, (uint64_t)ofi_handle->remote_addr,
-                      ofi_handle->remote_key, &ofi_handle->context);
-        NIXL_DEBUG << "fi_read returned: " << (ret == 0 ? "SUCCESS" : fi_strerror(-ret))
-                   << " (code: " << ret << ")";
-
-        // if immediate failure, check completion queue for errors
-        if (ret != 0) {
-            struct fi_cq_err_entry err;
-            if (fi_cq_readerr(nixlOfiUtils::txcq, &err, 0) > 0) {
-                NIXL_ERROR << "LibFabric CQ error: " << fi_strerror(err.err)
-                          << " (code: " << err.err << "), prov_errno: " << err.prov_errno;
-            }
-        }
+        // fi_read: read from remote memory into local buffer using reliable FT_POST pattern
+        OFI_POST(fi_read, nixlOfiUtils::txcq, "fi_read",
+                 nixlOfiUtils::ep, local_addr, ofi_handle->transfer_size, mr_desc,
+                 ofi_handle->remote_fi_addr, (uint64_t)ofi_handle->remote_addr,
+                 ofi_handle->remote_key, &ofi_handle->context);
+        NIXL_INFO << "fi_read completed successfully";
         break;
 
     case NIXL_WRITE:
-        // fi_write: write from local buffer to remote memory
-        ret = fi_write(nixlOfiUtils::ep, local_addr, ofi_handle->transfer_size, mr_desc,
-                       ofi_handle->remote_fi_addr, (uint64_t)ofi_handle->remote_addr,
-                       ofi_handle->remote_key, &ofi_handle->context);
-        NIXL_DEBUG << "fi_write returned: " << (ret == 0 ? "SUCCESS" : fi_strerror(-ret))
-                   << " (code: " << ret << ")";
+        // fi_write: write from local buffer to remote memory using reliable FT_POST pattern
+        OFI_POST(fi_write, nixlOfiUtils::txcq, "fi_write",
+                 nixlOfiUtils::ep, local_addr, ofi_handle->transfer_size, mr_desc,
+                 ofi_handle->remote_fi_addr, (uint64_t)ofi_handle->remote_addr,
+                 ofi_handle->remote_key, &ofi_handle->context);
+        NIXL_INFO << "fi_write completed successfully";
         break;
 
     default:
@@ -445,8 +436,7 @@ nixlOfiEngine::postXfer(const nixl_xfer_op_t &operation,
         return NIXL_ERR_BACKEND;
     }
 
-    // drive progress aggressively before attempting the operation (FI_PROGRESS_MANUAL)
-    // multiple calls to ensure CQs are drained and provider is ready
+    // drive progress before operation
     for (int i = 0; i < 10; i++) {
         drive_manual_progress();
     }
@@ -454,14 +444,14 @@ nixlOfiEngine::postXfer(const nixl_xfer_op_t &operation,
     // handle -FI_EAGAIN retry loop following LibFabric best practices
     int retry_count = 0;
     const auto &backend_params = getCustomParams();
-    const int max_retries = get_param_int(backend_params, "retry_count", 1000);
+    const int max_retries = get_param_int(backend_params, "retry_count", 100);
     const int retry_delay_us = get_param_int(backend_params, "retry_delay_us", 1);
 
     while (ret == -FI_EAGAIN && retry_count < max_retries) {
         retry_count++;
 
         if (retry_count % 100 == 0) {
-            NIXL_DEBUG << "RMA operation retry " << retry_count << "/" << max_retries
+            NIXL_INFO << "RMA operation retry " << retry_count << "/" << max_retries
                        << " still getting -FI_EAGAIN";
         }
 
@@ -508,10 +498,10 @@ nixlOfiEngine::postXfer(const nixl_xfer_op_t &operation,
                    << ", remote_key=" << ofi_handle->remote_key;
         return NIXL_ERR_BACKEND;
     } else {
-        NIXL_DEBUG << "LibFabric operation posted successfully after " << retry_count << " retries";
+        NIXL_INFO << "LibFabric operation posted successfully after " << retry_count << " retries";
     }
 
-    NIXL_DEBUG << "posted " << (ofi_handle->operation == NIXL_READ ? "READ" : "WRITE")
+    NIXL_INFO << "posted " << (ofi_handle->operation == NIXL_READ ? "READ" : "WRITE")
                << " operation: size=" << ofi_handle->transfer_size;
 
     return NIXL_SUCCESS;
@@ -528,12 +518,14 @@ nixl_status_t nixlOfiEngine::checkXfer(nixlBackendReqH* handle) const {
         return NIXL_SUCCESS;
     }
 
-    // check completion queue following server_bw.c pattern
+    // drive progress first to ensure completions are available
+    drive_manual_progress();
+
+    // check completion queue
     struct fi_cq_err_entry comp;
     int ret = fi_cq_read(nixlOfiUtils::txcq, &comp, 1);
 
     if (ret == -FI_EAGAIN) {
-        // no completion yet, still in progress
         return NIXL_IN_PROG;
     }
 
@@ -565,7 +557,9 @@ nixl_status_t nixlOfiEngine::releaseReqH(nixlBackendReqH* handle) const {
 }
 
 nixl_status_t
-nixlOfiEngine::createGpuXferReq(const nixlBackendReqH &handle,
+nixlOfiEngine::createGpuXferReq(const nixlBackendReqH &req_hndl,
+                                const nixl_meta_dlist_t &local_descs,
+                                const nixl_meta_dlist_t &remote_descs,
                                 nixlGpuXferReqH &gpu_req_hndl) const {
     return NIXL_ERR_NOT_SUPPORTED;
 }
