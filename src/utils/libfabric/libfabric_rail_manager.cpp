@@ -356,10 +356,13 @@ nixlLibfabricRailManager::selectRailsForMemory(void *mem_addr, nixl_mem_t mem_ty
         for (const std::string &efa_device : numa_efa_devices) {
             auto it = efa_device_to_rail_map.find(efa_device);
             if (it != efa_device_to_rail_map.end()) {
-                numa_rails.push_back(it->second);
-                NIXL_DEBUG << "DRAM memory " << mem_addr << " on NUMA node " << numa_node
-                           << " mapped to rail " << it->second << " (EFA device: " << efa_device
-                           << ")";
+                // Temp. fix for segv related to duplicate use of rails
+                if (std::find(numa_rails.begin(), numa_rails.end(), it->second) == numa_rails.end()) {
+                    numa_rails.push_back(it->second);
+                    NIXL_DEBUG << "DRAM memory " << mem_addr << " on NUMA node " << numa_node
+                               << " mapped to rail " << it->second << " (EFA device: " << efa_device
+                               << ")";
+                }
             }
         }
 
