@@ -703,9 +703,12 @@ nixlLibfabricEngine::establishConnection(const std::string &remote_agent) const 
     auto *conn_info = reinterpret_cast<nixlLibfabricConnection *>(it->second.get());
 
     NIXL_DEBUG << "Using connection info : 0: "
-               << LibfabricUtils::hexdump(conn_info->src_ep_names_[0]) << std::endl
-               << "1: " << LibfabricUtils::hexdump(conn_info->src_ep_names_[1]) << std::endl
-               << "control_0: " << LibfabricUtils::hexdump(conn_info->control_ep_names_[0])
+               << LibfabricUtils::hexdump(conn_info->src_ep_names_[0]) << std::endl;
+    
+    if (conn_info->src_ep_names_.size() > 1) {
+        NIXL_DEBUG  << "1: " << LibfabricUtils::hexdump(conn_info->src_ep_names_[1]) << std::endl;
+    }
+    NIXL_DEBUG << "control_0: " << LibfabricUtils::hexdump(conn_info->control_ep_names_[0])
                << std::endl
                << " with agent index: " << it->second->agent_index_;
     if (!conn_info) {
