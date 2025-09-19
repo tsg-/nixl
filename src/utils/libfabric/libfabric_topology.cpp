@@ -707,6 +707,12 @@ nixlLibfabricTopology::buildFallbackNumaMapping() {
                                                                start_idx + devices_per_numa;
             std::vector<std::string> numa_devices(all_libfabric_devices.begin() + start_idx,
                                                   all_libfabric_devices.begin() + end_idx);
+            
+            // Account for the case where there are more numa nodes than devices
+            if (numa_devices.empty()) {
+                numa_devices = all_libfabric_devices;
+            }
+            
             numa_to_libfabric_devices[numa_id] = numa_devices;
             NIXL_TRACE << "NUMA " << numa_id << " fallback mapping: " << numa_devices.size()
                        << " devices";
