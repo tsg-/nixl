@@ -178,6 +178,9 @@ private:
     mutable std::map<std::string, fi_addr_t> shmAddrs_;
     fid_av *av_;
     mutable std::mutex epLock_;
+
+    // List of received notifications
+    std::vector<OfiNotif> notifList_;
     bool isConnectionless_;
 
     std::thread eqThread_;

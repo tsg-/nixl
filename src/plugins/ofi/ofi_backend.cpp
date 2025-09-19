@@ -495,17 +495,49 @@ nixl_status_t nixlOfiEngine::getNotifs(notif_list_t &notif_list) {
     if (!notif_list.empty()) {
         return NIXL_ERR_INVALID_PARAM;
     }
-    
-    // TODO: Implement actual OFI notification mechanism using fi_cq_read or fi_eq_read
-    // For now, return empty list since OFI notifications are not yet implemented
+
+    // read notifications from cq
+    fi_cq_data_entry cq_entry;
+    ssize_t ret = 0;
+    while ((ret = fi_cq_read(cq_, &cq_entry, 1)) > 0) {
+        // parse message from cq_entry.buf
+        std::string payload(reinterpret_cast<const char*>(cq_entry.buf), cq_entry.len);
+        std::string agent = "unknown"; // todo: extract agent info
+        notifList_.emplace_back(agent, payload);
+    }
+    if (ret < 0 && ret != -FI_EAGAIN) {
+        NIXL_ERROR << "ofi getNotifs: fi_cq_read failed: " << fi_strerror(-ret);
+        return NIXL_ERR_BACKEND;
+    }
+
+    // copy notifications to output
+    for (const auto& n : notifList_) {
+        notif_list.emplace_back(n.agent, n.payload);
+    }
+    notifList_.clear();
+    NIXL_DEBUG << "ofi getNotifs: " << notif_list.size() << " notifications.";
     return NIXL_SUCCESS;
 }
 
 nixl_status_t nixlOfiEngine::genNotif(const std::string &remote_agent, const std::string &msg) const {
-    // TODO: Implement actual OFI notification sending mechanism
-    // This could use fi_send with a special notification message format
-    // For now, return success as a no-op to satisfy the interface
-    NIXL_DEBUG << "OFI genNotif stub called for agent " << remote_agent << " with message: " << msg;
+    // create notification message
+    OfiNotif notif(remote_agent, msg);
+    fid_ep* ep = nullptr;
+    auto it = connectedEps_.find(remote_agent);
+    if (it != connectedEps_.end()) {
+        ep = it->second;
+    } else {
+        NIXL_ERROR << "ofi genNotif: endpoint for agent " << remote_agent << " not found.";
+        return NIXL_ERR_INVALID_PARAM;
+    }
+
+    // send notification
+    int ret = fi_send(ep, notif.payload.data(), notif.payload.size(), nullptr, 0, nullptr);
+    if (ret) {
+        NIXL_ERROR << "ofi genNotif: fi_send failed for agent " << remote_agent << ", error: " << fi_strerror(-ret);
+        return NIXL_ERR_BACKEND;
+    }
+    NIXL_DEBUG << "ofi genNotif sent to agent " << remote_agent << ", message: " << msg;
     return NIXL_SUCCESS;
 }
 
