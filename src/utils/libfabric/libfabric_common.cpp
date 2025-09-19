@@ -81,8 +81,10 @@ getAvailableLibfabricDevices(const char* provider_name) {
                 device_name = prov_name + ":" + device_name;
             }
 
-            devices.push_back(device_name);
-            NIXL_DEBUG << "Found device: " << device_name << " (provider: " << prov_name << ")";
+            if (std::find(devices.begin(), devices.end(), device_name) == devices.end()) {
+                devices.push_back(device_name);
+                NIXL_DEBUG << "Found device: " << device_name << " (provider: " << prov_name << ")";
+            }
         }
     }
 
