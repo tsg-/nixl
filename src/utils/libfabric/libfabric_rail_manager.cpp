@@ -451,6 +451,80 @@ nixlLibfabricRailManager::registerMemory(void *buffer,
     return NIXL_SUCCESS;
 }
 
+#if defined(HAVE_CUDA) || defined(HAVE_SYNAPSEAI)
+nixl_status_t
+nixlLibfabricRailManager::registerMemory(void *buffer,
+                                         size_t length,
+                                         nixl_mem_t mem_type,
+                                         int device_id,
+                                         std::vector<struct fid_mr *> &mr_list_out,
+                                         std::vector<uint64_t> &key_list_out,
+                                         std::vector<size_t> &selected_rails_out) {
+    if (!buffer) {
+        NIXL_ERROR << "Invalid buffer parameter";
+        return NIXL_ERR_INVALID_PARAM;
+    }
+
+    // Use internal rail selection (moved from engine)
+    std::vector<size_t> selected_rails = selectRailsForMemory(buffer, mem_type);
+    if (selected_rails.empty()) {
+        NIXL_ERROR << "No rails selected for memory type " << mem_type;
+        return NIXL_ERR_NOT_SUPPORTED;
+    }
+
+    // Resize output vectors to match all rails
+    mr_list_out.resize(data_rails_.size(), nullptr);
+    key_list_out.resize(data_rails_.size(), 0);
+    selected_rails_out = selected_rails; // Return which rails were selected
+
+    // Register memory on each selected rail
+    for (size_t i = 0; i < selected_rails.size(); ++i) {
+        size_t rail_idx = selected_rails[i];
+        if (rail_idx >= data_rails_.size()) {
+            NIXL_ERROR << "Invalid rail index " << rail_idx;
+            // Cleanup already registered MRs
+            for (size_t cleanup_idx : selected_rails) {
+                if (cleanup_idx >= rail_idx) break; // Only cleanup what we've done so far
+                if (mr_list_out[cleanup_idx]) {
+                    data_rails_[cleanup_idx]->deregisterMemory(mr_list_out[cleanup_idx]);
+                    mr_list_out[cleanup_idx] = nullptr;
+                }
+            }
+            return NIXL_ERR_INVALID_PARAM;
+        }
+
+        struct fid_mr *mr;
+        uint64_t key;
+        nixl_status_t status = data_rails_[rail_idx]->registerMemory(
+            buffer, length, FI_REMOTE_WRITE | FI_REMOTE_READ, mem_type, device_id, &mr, &key);
+        if (status != NIXL_SUCCESS) {
+            NIXL_ERROR << "Failed to register memory on rail " << rail_idx;
+            // Cleanup already registered MRs
+            for (size_t cleanup_idx : selected_rails) {
+                if (cleanup_idx >= rail_idx) break; // Only cleanup what we've done so far
+                if (mr_list_out[cleanup_idx]) {
+                    data_rails_[cleanup_idx]->deregisterMemory(mr_list_out[cleanup_idx]);
+                    mr_list_out[cleanup_idx] = nullptr;
+                }
+            }
+            return status;
+        }
+
+        mr_list_out[rail_idx] = mr;
+        key_list_out[rail_idx] = key;
+
+        // Mark rail as active for progress tracking optimization
+        markRailActive(rail_idx);
+
+        NIXL_DEBUG << "Registered memory on rail " << rail_idx
+                   << " (mr: " << reinterpret_cast<uintptr_t>(mr) << ", key: " << key << ")"
+                   << " mem_type: " << mem_type << " device_id: " << device_id;
+    }
+
+    return NIXL_SUCCESS;
+}
+#endif
+
 nixl_status_t
 nixlLibfabricRailManager::deregisterMemory(const std::vector<size_t> &selected_rails,
                                            const std::vector<struct fid_mr *> &mr_list) {

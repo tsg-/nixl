@@ -117,6 +117,18 @@ public:
                    std::vector<struct fid_mr *> &mr_list_out,
                    std::vector<uint64_t> &key_list_out,
                    std::vector<size_t> &selected_rails_out);
+
+#if defined(HAVE_CUDA) || defined(HAVE_SYNAPSEAI)
+    /** Register memory with device ID support for GPU/DMA-BUF registration */
+    nixl_status_t
+    registerMemory(void *buffer,
+                   size_t length,
+                   nixl_mem_t mem_type,
+                   int device_id,
+                   std::vector<struct fid_mr *> &mr_list_out,
+                   std::vector<uint64_t> &key_list_out,
+                   std::vector<size_t> &selected_rails_out);
+#endif
     /** Deregister memory from specified rails
      * @param selected_rails List of rail IDs to deregister from
      * @param mr_list Memory registration handles to deregister
@@ -302,8 +314,11 @@ private:
     std::unordered_set<size_t> active_rails_;
 
     // Internal rail selection method
+public:
     std::vector<size_t>
     selectRailsForMemory(void *mem_addr, nixl_mem_t mem_type) const;
+
+private:
 
     // Helper functions for connection SerDes
     void

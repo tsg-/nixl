@@ -29,6 +29,11 @@
 #include "backend/backend_aux.h"
 #include "libfabric/libfabric_common.h"
 
+#ifdef HAVE_SYNAPSEAI
+#include <habanalabs/synapse_api.h>
+#include <habanalabs/hlthunk.h>
+#endif
+
 // Forward declarations
 class nixlLibfabricConnection;
 
@@ -243,6 +248,18 @@ public:
                    uint64_t access_flags,
                    struct fid_mr **mr_out,
                    uint64_t *key_out) const;
+
+#if defined(HAVE_CUDA) || defined(HAVE_SYNAPSEAI)
+    /** Register memory buffer with libfabric supporting GPU/DMA-BUF path */
+    nixl_status_t
+    registerMemory(void *buffer,
+                   size_t length,
+                   uint64_t access_flags,
+                   nixl_mem_t mem_type,
+                   int device_id,
+                   struct fid_mr **mr_out,
+                   uint64_t *key_out) const;
+#endif
 
     /** Deregister memory from libfabric */
     nixl_status_t

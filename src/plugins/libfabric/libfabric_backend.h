@@ -325,6 +325,17 @@ private:
     synapseFiniCtx();
 #endif
 
+#if defined(HAVE_CUDA) || defined(HAVE_SYNAPSEAI)
+    // Direct GPU memory registration method
+    nixl_status_t
+    registerVramMemoryDirect(void *buffer,
+                           size_t length,
+                           int device_id,
+                           std::vector<struct fid_mr *> &mr_list_out,
+                           std::vector<uint64_t> &key_list_out,
+                           std::vector<size_t> &selected_rails_out);
+#endif
+
 public:
     /** Initialize multi-rail libfabric backend engine */
     nixlLibfabricEngine(const nixlBackendInitParams *init_params);

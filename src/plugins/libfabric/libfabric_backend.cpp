@@ -863,12 +863,34 @@ nixlLibfabricEngine::registerMem(const nixlBlobDesc &mem,
     }
 
     // Use Rail Manager for centralized memory registration with GPU Direct RDMA support
-    nixl_status_t status = rail_manager.registerMemory((void *)mem.addr,
-                                                       mem.len,
-                                                       nixl_mem,
-                                                       priv->rail_mr_list_,
-                                                       priv->rail_key_list_,
-                                                       priv->selected_rails_);
+    nixl_status_t status;
+#if defined(HAVE_CUDA) || defined(HAVE_SYNAPSEAI)
+    if (nixl_mem == VRAM_SEG) {
+        // Handle GPU memory registration directly in the plugin to avoid utils library dependency issues
+        status = registerVramMemoryDirect((void *)mem.addr,
+                                         mem.len,
+                                         mem.devId,
+                                         priv->rail_mr_list_,
+                                         priv->rail_key_list_,
+                                         priv->selected_rails_);
+    } else {
+        // Use standard registration for DRAM
+        status = rail_manager.registerMemory((void *)mem.addr,
+                                            mem.len,
+                                            nixl_mem,
+                                            priv->rail_mr_list_,
+                                            priv->rail_key_list_,
+                                            priv->selected_rails_);
+    }
+#else
+    // When GPU support not compiled, always use standard registration
+    status = rail_manager.registerMemory((void *)mem.addr,
+                                        mem.len,
+                                        nixl_mem,
+                                        priv->rail_mr_list_,
+                                        priv->rail_key_list_,
+                                        priv->selected_rails_);
+#endif
     if (status != NIXL_SUCCESS) {
         NIXL_ERROR << "Rail Manager registerMemory failed";
         return status;
@@ -1637,3 +1659,74 @@ nixlLibfabricEngine::cleanup() {
 
     NIXL_DEBUG << "Cleanup all resources complete";
 }
+
+#if defined(HAVE_CUDA) || defined(HAVE_SYNAPSEAI)
+nixl_status_t
+nixlLibfabricEngine::registerVramMemoryDirect(void *buffer,
+                                             size_t length,
+                                             int device_id,
+                                             std::vector<struct fid_mr *> &mr_list_out,
+                                             std::vector<uint64_t> &key_list_out,
+                                             std::vector<size_t> &selected_rails_out) {
+    if (!buffer) {
+        NIXL_ERROR << "Invalid buffer parameter";
+        return NIXL_ERR_INVALID_PARAM;
+    }
+
+    // Use rail manager for rail selection (this is always available)
+    std::vector<size_t> selected_rails = rail_manager.selectRailsForMemory(buffer, VRAM_SEG);
+    if (selected_rails.empty()) {
+        NIXL_ERROR << "No rails selected for VRAM memory";
+        return NIXL_ERR_NOT_SUPPORTED;
+    }
+
+    // Resize output vectors to match all rails
+    mr_list_out.resize(rail_manager.getNumDataRails(), nullptr);
+    key_list_out.resize(rail_manager.getNumDataRails(), 0);
+    selected_rails_out = selected_rails;
+
+    // Register memory directly on each selected rail using device-aware method
+    for (size_t i = 0; i < selected_rails.size(); ++i) {
+        size_t rail_idx = selected_rails[i];
+        if (rail_idx >= rail_manager.getNumDataRails()) {
+            NIXL_ERROR << "Invalid rail index " << rail_idx;
+            // Cleanup already registered MRs
+            for (size_t cleanup_idx : selected_rails) {
+                if (cleanup_idx >= rail_idx) break;
+                if (mr_list_out[cleanup_idx]) {
+                    rail_manager.getDataRail(cleanup_idx).deregisterMemory(mr_list_out[cleanup_idx]);
+                    mr_list_out[cleanup_idx] = nullptr;
+                }
+            }
+            return NIXL_ERR_INVALID_PARAM;
+        }
+
+        struct fid_mr *mr;
+        uint64_t key;
+        nixl_status_t status = rail_manager.getDataRail(rail_idx).registerMemory(
+            buffer, length, FI_REMOTE_WRITE | FI_REMOTE_READ, VRAM_SEG, device_id, &mr, &key);
+
+        if (status != NIXL_SUCCESS) {
+            NIXL_ERROR << "Failed to register VRAM memory on rail " << rail_idx;
+            // Cleanup already registered MRs
+            for (size_t cleanup_idx : selected_rails) {
+                if (cleanup_idx >= rail_idx) break;
+                if (mr_list_out[cleanup_idx]) {
+                    rail_manager.getDataRail(cleanup_idx).deregisterMemory(mr_list_out[cleanup_idx]);
+                    mr_list_out[cleanup_idx] = nullptr;
+                }
+            }
+            return status;
+        }
+
+        mr_list_out[rail_idx] = mr;
+        key_list_out[rail_idx] = key;
+
+        NIXL_DEBUG << "Registered VRAM memory on rail " << rail_idx
+                   << " (mr: " << reinterpret_cast<uintptr_t>(mr) << ", key: " << key << ")"
+                   << " device_id: " << device_id;
+    }
+
+    return NIXL_SUCCESS;
+}
+#endif

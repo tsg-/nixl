@@ -1052,6 +1052,93 @@ nixlLibfabricRail::registerMemory(void *buffer,
     return NIXL_SUCCESS;
 }
 
+#if defined(HAVE_CUDA) || defined(HAVE_SYNAPSEAI)
+nixl_status_t
+nixlLibfabricRail::registerMemory(void *buffer,
+                                  size_t length,
+                                  uint64_t access_flags,
+                                  nixl_mem_t mem_type,
+                                  int device_id,
+                                  struct fid_mr **mr_out,
+                                  uint64_t *key_out) const {
+    if (!buffer || !mr_out || !key_out) {
+        NIXL_ERROR << "Invalid parameters on rail " << rail_id;
+        return NIXL_ERR_INVALID_PARAM;
+    }
+    if (!domain) {
+        NIXL_ERROR << "Domain not initialized on rail " << rail_id;
+        return NIXL_ERR_BACKEND;
+    }
+
+#ifdef HAVE_SYNAPSEAI
+    // Handle SynapseAI DMA-BUF registration
+    if (mem_type == VRAM_SEG && device_id >= 0) {
+        NIXL_DEBUG << "Using SynapseAI DMA-BUF registration for device " << device_id
+                   << " on rail " << rail_id;
+
+        // Export DMA-BUF file descriptor using hlthunk
+        int dmabuf_fd = hlthunk_device_mapped_memory_export_dmabuf_fd(
+            device_id,                    // device file descriptor
+            reinterpret_cast<uint64_t>(buffer), // memory address
+            length,                       // memory length
+            0,                           // offset
+            0                            // flags
+        );
+
+        if (dmabuf_fd < 0) {
+            NIXL_ERROR << "hlthunk_device_mapped_memory_export_dmabuf_fd failed on rail "
+                       << rail_id << ": " << strerror(-dmabuf_fd);
+            return NIXL_ERR_BACKEND;
+        }
+
+        NIXL_DEBUG << "Exported DMA-BUF fd: " << dmabuf_fd << " for rail " << rail_id;
+
+        // Prepare DMA-BUF registration structure
+        struct fi_mr_dmabuf dmabuf = {};
+        dmabuf.fd = dmabuf_fd;
+        dmabuf.offset = 0;
+        dmabuf.len = length;
+        dmabuf.base_addr = buffer;
+
+        // Prepare memory registration attributes
+        struct fi_mr_attr mr_attr = {};
+        mr_attr.mr_iov = nullptr;
+        mr_attr.iov_count = 0;
+        mr_attr.access = access_flags;
+        mr_attr.dmabuf = &dmabuf;
+        mr_attr.iface = FI_HMEM_SYNAPSEAI;
+        mr_attr.device.synapseai = static_cast<uint32_t>(device_id);
+
+        NIXL_DEBUG << "Registering SynapseAI memory via DMA-BUF on rail " << rail_id
+                   << " addr=0x" << std::hex << reinterpret_cast<uintptr_t>(buffer)
+                   << " len=" << std::dec << length << " fd=" << dmabuf_fd;
+
+        struct fid_mr *mr;
+        int ret = fi_mr_regattr(domain, &mr_attr, FI_MR_DMABUF, &mr);
+
+        // Close DMA-BUF file descriptor
+        close(dmabuf_fd);
+
+        if (ret) {
+            NIXL_ERROR << "fi_mr_regattr with FI_MR_DMABUF failed on rail " << rail_id
+                       << ": " << fi_strerror(-ret);
+            return NIXL_ERR_BACKEND;
+        }
+
+        *mr_out = mr;
+        *key_out = fi_mr_key(mr);
+
+        NIXL_DEBUG << "Successfully registered SynapseAI memory via DMA-BUF on rail "
+                   << rail_id << " with key: " << *key_out;
+        return NIXL_SUCCESS;
+    }
+#endif
+
+    // Fall back to standard registration for DRAM or when SynapseAI not available
+    return registerMemory(buffer, length, access_flags, mr_out, key_out);
+}
+#endif
+
 nixl_status_t
 nixlLibfabricRail::deregisterMemory(struct fid_mr *mr) const {
     if (!mr) {
