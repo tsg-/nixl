@@ -59,6 +59,15 @@ public:
     ~nixlOfiRequest() { }
 };
 
+class OfiNotif {
+public:
+    std::string agent;
+    std::string payload;
+
+    OfiNotif(const std::string& agent_name, const std::string& msg)
+        : agent(agent_name), payload(msg) { }
+};
+
 class nixlOfiEngine : public nixlBackendEngine {
 public:
     // constructors and destructor
