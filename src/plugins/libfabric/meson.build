@@ -33,6 +33,29 @@ if cuda_dep.found()
     compile_flags += ['-DHAVE_CUDA']
 endif
 
+# Add SynapseAI support if available
+synapseai_dep = dependency('synapseai', required: false)
+if not synapseai_dep.found()
+    # Try to find hl-thunk in standard locations first
+    synapseai_dep = cpp.find_library('hl-thunk', required: false)
+endif
+if not synapseai_dep.found()
+    # Try to find hl-thunk in Habana-specific locations
+    synapseai_dep = cpp.find_library('hl-thunk',
+                                    dirs: ['/usr/lib/habanalabs', '/usr/local/lib/habanalabs'],
+                                    required: false)
+endif
+
+if synapseai_dep.found()
+    # Create proper dependency with include paths
+    synapseai_dep = declare_dependency(
+        dependencies: synapseai_dep,
+        include_directories: include_directories('/usr/include/habanalabs')
+    )
+    libfabric_plugin_deps += [synapseai_dep]
+    compile_flags += ['-DHAVE_SYNAPSEAI']
+endif
+
 # Build as static or shared library based on configuration
 if 'LIBFABRIC' in static_plugins
     libfabric_backend_lib = static_library(

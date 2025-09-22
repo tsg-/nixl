@@ -164,6 +164,18 @@ nixlLibfabricEngine::vramFiniCtx() {
 }
 #endif
 
+#ifdef HAVE_SYNAPSEAI
+void
+nixlLibfabricEngine::synapseInitCtx() {
+    synapseCtx_ = std::make_unique<nixlLibfabricSynapseAICtx>();
+}
+
+void
+nixlLibfabricEngine::synapseFiniCtx() {
+    synapseCtx_.reset();
+}
+#endif
+
 /****************************************
  * Request Management
  *****************************************/
@@ -239,6 +251,11 @@ nixlLibfabricEngine::nixlLibfabricEngine(const nixlBackendInitParams *init_param
         cuda_addr_wa_ = true;
         NIXL_DEBUG << "CUDA address workaround enabled";
     }
+#endif
+
+#ifdef HAVE_SYNAPSEAI
+    // Initialize SynapseAI context management
+    synapseInitCtx();
 #endif
 
     // Parse striping threshold parameter
@@ -782,7 +799,7 @@ nixl_mem_list_t
 nixlLibfabricEngine::getSupportedMems() const {
     nixl_mem_list_t mems;
     mems.push_back(DRAM_SEG);
-#ifdef HAVE_CUDA
+#if defined(HAVE_CUDA) || defined(HAVE_SYNAPSEAI)
     mems.push_back(VRAM_SEG);
 #endif
     return mems;
@@ -798,10 +815,10 @@ nixlLibfabricEngine::registerMem(const nixlBlobDesc &mem,
     priv->length_ = mem.len;
     priv->gpu_device_id_ = mem.devId; // Store GPU device ID
 
-#ifdef HAVE_CUDA
-    // Handle CUDA memory registration with GPU Direct RDMA support
+    // Handle GPU memory registration (CUDA or SynapseAI)
     if (nixl_mem == VRAM_SEG) {
-        // For multi-GPU support, skip CUDA address workaround
+#ifdef HAVE_CUDA
+        // Handle CUDA memory registration with GPU Direct RDMA support
         if (cuda_addr_wa_) {
             bool need_restart;
             if (vramUpdateCtx((void *)mem.addr, mem.devId, need_restart)) {
@@ -824,19 +841,26 @@ nixlLibfabricEngine::registerMem(const nixlBlobDesc &mem,
             }
             NIXL_DEBUG << "Set CUDA device context to GPU " << mem.devId;
         }
-    }
 #endif
+
+#ifdef HAVE_SYNAPSEAI
+        // Handle SynapseAI memory registration
+        NIXL_DEBUG << "Registering SynapseAI device memory for device " << mem.devId;
+        // SynapseAI-specific setup would go here if needed
+#endif
+    }
 
     // Initialize vectors to accommodate all possible rails (for indexing consistency)
     priv->rail_mr_list_.resize(rail_manager.getNumDataRails(), nullptr);
     priv->rail_key_list_.resize(rail_manager.getNumDataRails(), 0);
 
-#ifdef HAVE_CUDA
-    // Set CUDA context before libfabric operations for VRAM
+    // Set GPU context before libfabric operations for VRAM
     if (nixl_mem == VRAM_SEG) {
+#ifdef HAVE_CUDA
         vramApplyCtx();
-    }
 #endif
+        // SynapseAI context application would go here if needed
+    }
 
     // Use Rail Manager for centralized memory registration with GPU Direct RDMA support
     nixl_status_t status = rail_manager.registerMemory((void *)mem.addr,
@@ -1604,6 +1628,11 @@ nixlLibfabricEngine::cleanup() {
 #ifdef HAVE_CUDA
     // Cleanup CUDA context
     vramFiniCtx();
+#endif
+
+#ifdef HAVE_SYNAPSEAI
+    // Cleanup SynapseAI context
+    synapseFiniCtx();
 #endif
 
     NIXL_DEBUG << "Cleanup all resources complete";

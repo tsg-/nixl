@@ -42,6 +42,11 @@
 #include <cuda_runtime.h>
 #endif
 
+#ifdef HAVE_SYNAPSEAI
+#include <habanalabs/synapse_api.h>
+#include <habanalabs/hlthunk.h>
+#endif
+
 // Forward declarations
 class nixlLibfabricEngine;
 
@@ -69,6 +74,36 @@ public:
     /** Set the current CUDA context */
     int
     cudaSetCtx();
+};
+#endif
+
+#ifdef HAVE_SYNAPSEAI
+/** SynapseAI context management for libfabric backend */
+class nixlLibfabricSynapseAICtx {
+private:
+    synDeviceId deviceId_;
+    synStreamHandle streamHandle_;
+    synDeviceInfoV2 deviceInfo_;
+    int hlthunk_device_fd_;
+
+public:
+    nixlLibfabricSynapseAICtx() {
+        deviceId_ = UINT32_MAX;
+        streamHandle_ = nullptr;
+        hlthunk_device_fd_ = -1;
+    }
+
+    /** Reset SynapseAI context to initial state */
+    void
+    synapseResetCtx();
+
+    /** Update SynapseAI context for given device */
+    int
+    synapseUpdateCtx(int device_id, bool &was_updated);
+
+    /** Apply SynapseAI context */
+    int
+    synapseApplyCtx();
 };
 #endif
 
@@ -242,6 +277,11 @@ private:
     bool cuda_addr_wa_; // CUDA address workaround flag
 #endif
 
+#ifdef HAVE_SYNAPSEAI
+    // SynapseAI context management
+    std::unique_ptr<nixlLibfabricSynapseAICtx> synapseCtx_;
+#endif
+
     // ConnectionManagement thread and completion processing
     nixl_status_t
     cmThread();
@@ -275,6 +315,14 @@ private:
     vramApplyCtx();
     void
     vramFiniCtx();
+#endif
+
+#ifdef HAVE_SYNAPSEAI
+    // SynapseAI context management methods
+    void
+    synapseInitCtx();
+    void
+    synapseFiniCtx();
 #endif
 
 public:
