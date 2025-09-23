@@ -40,6 +40,8 @@
 #include <atomic>
 #include <condition_variable>
 #include <chrono>
+#include <cstring>
+#include <unordered_set>
 
 class nixlOfiMetadata : public nixlBackendMD {
 public:
@@ -59,13 +61,59 @@ public:
     ~nixlOfiRequest() { }
 };
 
-class OfiNotif {
-public:
-    std::string agent;
-    std::string payload;
 
-    OfiNotif(const std::string& agent_name, const std::string& msg)
-        : agent(agent_name), payload(msg) { }
+// max xfer ids per notification
+#define OFI_MAX_XFER_IDS 128
+
+// binary notification structure for ofi plugin
+struct OfiBinaryNotification {
+    char agent_name[256];        // fixed-size agent name (null-terminated)
+    char message[1024];         // fixed-size message (null-terminated)
+    uint32_t xfer_id_count;     // number of xfer ids
+    uint32_t xfer_ids[OFI_MAX_XFER_IDS]; // fixed array of xfer ids
+
+    // clear all fields to zero
+    void clear() {
+        memset(this, 0, sizeof(OfiBinaryNotification));
+    }
+
+    // set agent name with bounds checking
+    void setAgentName(const std::string &name) {
+        strncpy(agent_name, name.c_str(), sizeof(agent_name) - 1);
+        agent_name[sizeof(agent_name) - 1] = '\0';
+    }
+
+    // set message with bounds checking
+    void setMessage(const std::string &msg) {
+        strncpy(message, msg.c_str(), sizeof(message) - 1);
+        message[sizeof(message) - 1] = '\0';
+    }
+
+    // add xfer id if space available
+    void addXferId(uint32_t xfer_id) {
+        if (xfer_id_count < OFI_MAX_XFER_IDS) {
+            xfer_ids[xfer_id_count++] = xfer_id;
+        }
+    }
+
+    // get agent name as string
+    std::string getAgentName() const {
+        return std::string(agent_name);
+    }
+
+    // get message as string
+    std::string getMessage() const {
+        return std::string(message);
+    }
+
+    // get all xfer ids as unordered set
+    std::unordered_set<uint32_t> getXferIds() const {
+        std::unordered_set<uint32_t> result;
+        for (uint32_t i = 0; i < xfer_id_count && i < OFI_MAX_XFER_IDS; ++i) {
+            result.insert(xfer_ids[i]);
+        }
+        return result;
+    }
 };
 
 class nixlOfiEngine : public nixlBackendEngine {
@@ -114,7 +162,7 @@ public:
     nixl_status_t loadRemoteMD(const nixlBlobDesc &input, const nixl_mem_t &nixl_mem, 
                                const std::string &remote_agent, nixlBackendMD* &output) override;
 
-    // Notification methods (required when supportsNotif() = true)
+    // notification methods (required when supportsNotif() = true)
     nixl_status_t getNotifs(notif_list_t &notif_list) override;
     nixl_status_t genNotif(const std::string &remote_agent, const std::string &msg) const override;
 
@@ -123,6 +171,12 @@ private:
     void atomicDecrementCompletions(std::atomic<uint64_t>& counter, uint64_t count) const;
     bool handleErrorCompletion(fid_cq* cq, std::atomic<uint64_t>& pending_ops) const;
     int drainCompletionBatch(fid_cq* cq, std::atomic<uint64_t>& pending_ops) const;
+
+    // notification system helper methods
+    void processNotification(const std::string &serialized_notif);
+    bool allXferIdsReceived(const std::unordered_set<uint32_t> &expected);
+    void checkPendingNotifications();
+    void addReceivedXferId(uint32_t xfer_id);
 
     // type definitions and nested classes
     struct ProviderConfig {
@@ -201,8 +255,30 @@ private:
     fid_av *av_;
     mutable std::mutex epLock_;
 
-    // List of received notifications
-    std::vector<OfiNotif> notifList_;
+    // notification system with thread safety
+    mutable std::mutex notif_mutex_;
+    std::vector<std::pair<std::string, std::string>> notifMainList_;
+
+    // pending notification tracking
+    struct PendingNotification {
+        std::string remote_agent;
+        std::string message;
+        std::unordered_set<uint32_t> expected_xfer_ids;
+        std::chrono::steady_clock::time_point received_time;
+
+        PendingNotification(const std::string &agent,
+                            const std::string &msg,
+                            const std::unordered_set<uint32_t> &xfer_ids)
+            : remote_agent(agent),
+              message(msg),
+              expected_xfer_ids(xfer_ids),
+              received_time(std::chrono::steady_clock::now()) {}
+    };
+
+    mutable std::mutex receiver_tracking_mutex_;
+    std::unordered_set<uint32_t> received_remote_writes_;
+    std::vector<PendingNotification> pending_notifications_;
+
     bool isConnectionless_;
 
     std::thread eqThread_;
@@ -212,14 +288,14 @@ private:
     std::condition_variable eqPauseCV_;
     long eqTimeoutMs_;
 
-    // connection-focused progress thread infrastructure
+    // connection-focused progress thread
     std::thread connectionProgressThread_;
     std::atomic<bool> connectionProgressStop_;
     std::atomic<bool> shutdownFlag_;
     bool connectionProgressEnabled_;
     nixlTime::us_t connectionProgressDelay_;
 
-    // intelligent main-thread progress rate limiting
+    // main-thread progress rate limiting
     mutable std::atomic<std::chrono::steady_clock::time_point> lastProgressTime_;
     static const std::chrono::milliseconds PROGRESS_INTERVAL;
     bool hmemZeSupported_;
@@ -228,7 +304,7 @@ private:
 
     std::string localAgentName_;
 
-    // synapseAI dynamic loading handles
+    // synapseai dynamic loading handles
     static void *synapseai_handle_;
     static void *hlthunk_handle_;
     

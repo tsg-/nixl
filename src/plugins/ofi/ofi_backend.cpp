@@ -517,32 +517,51 @@ nixl_status_t nixlOfiEngine::getNotifs(notif_list_t &notif_list) {
         return NIXL_ERR_INVALID_PARAM;
     }
 
-    // read notifications from cq
+    // read notifications from completion queue with enhanced processing
     fi_cq_data_entry cq_entry;
     ssize_t ret = 0;
     while ((ret = fi_cq_read(cq_, &cq_entry, 1)) > 0) {
-        // parse message from cq_entry.buf
-        std::string payload(reinterpret_cast<const char*>(cq_entry.buf), cq_entry.len);
-        std::string agent = "unknown"; // todo: extract agent info
-        notifList_.emplace_back(agent, payload);
+        // safely parse message from cq_entry.buf
+        if (cq_entry.buf != nullptr && cq_entry.len > 0) {
+            // check if binary notification format
+            // handle text-based notifications (safe fallback)
+            std::string payload(reinterpret_cast<const char*>(cq_entry.buf), cq_entry.len);
+            std::string agent = "unknown"; // todo: extract agent info
+            std::lock_guard<std::mutex> lock(notif_mutex_);
+            notifMainList_.emplace_back(agent, payload);
+            NIXL_DEBUG << "processed notification: " << payload;
+        } else {
+            // handle null buffer or zero length
+            NIXL_DEBUG << "cq entry has null buffer or zero length, skipping";
+        }
     }
     if (ret < 0 && ret != -FI_EAGAIN) {
         NIXL_ERROR << "ofi getNotifs: fi_cq_read failed: " << fi_strerror(-ret);
         return NIXL_ERR_BACKEND;
     }
 
-    // copy notifications to output
-    for (const auto& n : notifList_) {
-        notif_list.emplace_back(n.agent, n.payload);
+    // thread-safe access to notification list
+    {
+        std::lock_guard<std::mutex> lock(notif_mutex_);
+
+        // move all notifications from list to user's list
+        notif_list.insert(notif_list.end(), notifMainList_.begin(), notifMainList_.end());
+
+        if (!notifMainList_.empty()) {
+            NIXL_DEBUG << "retrieved " << notifMainList_.size() << " notifications";
+            notifMainList_.clear();
+        }
     }
-    notifList_.clear();
-    NIXL_DEBUG << "ofi getNotifs: " << notif_list.size() << " notifications.";
-    return NIXL_SUCCESS;
+
+    if (!notif_list.empty()) {
+        NIXL_DEBUG << "ofi getNotifs: returning " << notif_list.size() << " total notifications";
+        return NIXL_SUCCESS;
+    }
+
+    return NIXL_IN_PROG; // no notifications available
 }
 
 nixl_status_t nixlOfiEngine::genNotif(const std::string &remote_agent, const std::string &msg) const {
-    // create notification message
-    OfiNotif notif(remote_agent, msg);
     fid_ep* ep = nullptr;
     auto it = connectedEps_.find(remote_agent);
     if (it != connectedEps_.end()) {
@@ -552,13 +571,15 @@ nixl_status_t nixlOfiEngine::genNotif(const std::string &remote_agent, const std
         return NIXL_ERR_INVALID_PARAM;
     }
 
-    // send notification
-    int ret = fi_send(ep, notif.payload.data(), notif.payload.size(), nullptr, 0, nullptr);
+    // send text notification (safe fallback)
+    int ret = fi_send(ep, msg.c_str(), msg.length(), nullptr, 0, nullptr);
     if (ret) {
         NIXL_ERROR << "ofi genNotif: fi_send failed for agent " << remote_agent << ", error: " << fi_strerror(-ret);
         return NIXL_ERR_BACKEND;
     }
-    NIXL_DEBUG << "ofi genNotif sent to agent " << remote_agent << ", message: " << msg;
+
+    NIXL_DEBUG << "ofi genNotif sent notification to agent " << remote_agent
+               << ", message: " << msg;
     return NIXL_SUCCESS;
 }
 
@@ -2115,3 +2136,108 @@ void nixlOfiEngine::releaseCQ(fid_cq* cq) const {
 }
 
 
+
+
+// enhanced notification system helper methods
+
+void nixlOfiEngine::processNotification(const std::string &serialized_notif) {
+    // check if binary notification (fixed size)
+    NIXL_DEBUG << "received notification size: " << serialized_notif.size()
+               << ", sizeof(OfiBinaryNotification): " << sizeof(OfiBinaryNotification);
+
+    if (serialized_notif.size() != sizeof(OfiBinaryNotification)) {
+        NIXL_ERROR << "invalid notification size: " << serialized_notif.size()
+                   << ", expected: " << sizeof(OfiBinaryNotification);
+        return;
+    }
+
+    // process binary notification format
+    OfiBinaryNotification binary_notif;
+    std::memcpy(&binary_notif, serialized_notif.data(), sizeof(OfiBinaryNotification));
+
+    std::string remote_name = binary_notif.getAgentName();
+    std::string msg = binary_notif.getMessage();
+    std::unordered_set<uint32_t> expected_xfer_ids = binary_notif.getXferIds();
+
+    NIXL_TRACE << "received binary notification from " << remote_name << " msg: " << msg
+               << " xfer_id_count: " << binary_notif.xfer_id_count;
+
+    // check if transfer notification needs queuing
+    if (!expected_xfer_ids.empty()) {
+        // check if all expected XFER_IDs already arrived
+        if (allXferIdsReceived(expected_xfer_ids)) {
+            NIXL_TRACE << "all XFER_IDs already received, processing immediately";
+            std::lock_guard<std::mutex> lock(notif_mutex_);
+            notifMainList_.push_back({remote_name, msg});
+            NIXL_DEBUG << "binary notification processed immediately: " << msg;
+        } else {
+            NIXL_TRACE << "not all XFER_IDs received yet, queuing notification";
+            std::lock_guard<std::mutex> lock(receiver_tracking_mutex_);
+            pending_notifications_.emplace_back(remote_name, msg, expected_xfer_ids);
+            NIXL_TRACE << "binary notification queued for later processing: " << msg;
+        }
+    } else {
+        // regular notification without XFER_IDs - process immediately
+        NIXL_TRACE << "regular binary notification (no XFER_IDs), processing immediately";
+        std::lock_guard<std::mutex> lock(notif_mutex_);
+        notifMainList_.push_back({remote_name, msg});
+        NIXL_TRACE << "regular binary notification processed immediately: " << msg;
+    }
+}
+
+bool nixlOfiEngine::allXferIdsReceived(const std::unordered_set<uint32_t> &expected) {
+    std::lock_guard<std::mutex> lock(receiver_tracking_mutex_);
+    // check if all expected XFER_IDs are in received set
+    for (uint32_t xfer_id : expected) {
+        if (received_remote_writes_.find(xfer_id) == received_remote_writes_.end()) {
+            NIXL_TRACE << "XFER_ID " << xfer_id << " not yet received";
+            return false;
+        }
+    }
+    NIXL_DEBUG << "all " << expected.size() << " expected XFER_IDs received";
+    return true;
+}
+
+void nixlOfiEngine::checkPendingNotifications() {
+    std::lock_guard<std::mutex> lock(receiver_tracking_mutex_);
+    auto it = pending_notifications_.begin();
+    while (it != pending_notifications_.end()) {
+        // Check if all expected XFER_IDs for this notification have arrived
+        bool all_received = true;
+        for (uint32_t xfer_id : it->expected_xfer_ids) {
+            if (received_remote_writes_.find(xfer_id) == received_remote_writes_.end()) {
+                all_received = false;
+                break;
+            }
+        }
+
+        if (all_received) {
+            NIXL_TRACE << "All XFER_IDs received for queued notification, processing now";
+
+            // Move notification to main list (need to acquire notif_mutex_)
+            {
+                std::lock_guard<std::mutex> notif_lock(notif_mutex_);
+                notifMainList_.push_back({it->remote_agent, it->message});
+            }
+
+            NIXL_TRACE << "Processed queued notification: " << it->message;
+
+            // Remove from pending list
+            it = pending_notifications_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void nixlOfiEngine::addReceivedXferId(uint32_t xfer_id) {
+    {
+        std::lock_guard<std::mutex> lock(receiver_tracking_mutex_);
+        received_remote_writes_.insert(xfer_id);
+        NIXL_DEBUG << "Added received XFER_ID " << xfer_id
+                   << " to global tracking set (total: " << received_remote_writes_.size() << ")";
+    }
+
+    // Check if any pending notifications can now be processed
+    checkPendingNotifications();
+}
