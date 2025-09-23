@@ -150,6 +150,10 @@ private:
     void driveProgressIfNeeded() const;
     int ofi_progress_manual(fid_cq *cq) const;
     bool isConnectionlessProvider() const;
+
+    // cq reference counting helpers
+    fid_cq* acquireCQ() const;
+    void releaseCQ(fid_cq* cq) const;
     nixl_status_t setupEndpoint(bool connection_oriented);
     static nixl_status_t getEndpointAddress(fid_ep* endpoint, std::string& address);
     static void detectHmemCapabilities(struct fi_info* fi_info,
@@ -183,6 +187,10 @@ private:
     fid_eq *eq_;
     fid_pep *pep_;
     struct fi_info *fi_;
+
+    // cq reference counting to prevent destructor race
+    mutable std::atomic<int> cq_refcount_;
+    mutable std::mutex cq_mutex_;
 
     std::string providerName_;
     struct fi_info *cachedProviderInfo_;

@@ -67,6 +67,7 @@ nixlOfiEngine::nixlOfiEngine(const nixlBackendInitParams* init_params) :
     eq_(nullptr),
     pep_(nullptr),
     fi_(nullptr),
+    cq_refcount_(0),
     cachedProviderInfo_(nullptr),
     av_(nullptr),
     isConnectionless_(false),
@@ -473,7 +474,18 @@ nixlOfiEngine::~nixlOfiEngine() {
 
     if (pep_)    { fi_close(&pep_->fid);    pep_ = nullptr; }
     if (ep_)     { fi_close(&ep_->fid);     ep_ = nullptr; }
-    if (cq_)     { fi_close(&cq_->fid);     cq_ = nullptr; }
+
+    // wait for all cq references to be released before closing
+    if (cq_) {
+        NIXL_DEBUG << "Waiting for CQ references to be released...";
+        while (cq_refcount_.load() > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        NIXL_DEBUG << "All CQ references released, closing CQ";
+        fi_close(&cq_->fid);
+        cq_ = nullptr;
+    }
+
     if (eq_)     { fi_close(&eq_->fid);     eq_ = nullptr; }
     if (av_)     { fi_close(&av_->fid);     av_ = nullptr; }
     if (domain_) { fi_close(&domain_->fid); domain_ = nullptr; }
@@ -1317,6 +1329,14 @@ nixl_status_t nixlOfiEngine::releaseReqH(nixlBackendReqH* handle) const {
         return NIXL_ERR_INVALID_PARAM;
     }
 
+    // acquire cq reference to prevent destructor race
+    fid_cq* cq = acquireCQ();
+    if (!cq) {
+        NIXL_DEBUG << "CQ not available (shutdown in progress), skipping completion drain";
+        delete ofi_req;
+        return NIXL_SUCCESS;
+    }
+
     uint64_t pending_ops = ofi_req->wr_id.load();
     if (pending_ops > 0) {
         int drain_attempts = 0;
@@ -1327,12 +1347,12 @@ nixl_status_t nixlOfiEngine::releaseReqH(nixlBackendReqH* handle) const {
         NIXL_DEBUG << "Draining " << pending_ops << " pending operations (max attempts: " << total_attempts << ")";
 
         while (ofi_req->wr_id.load() > 0 && drain_attempts < total_attempts) {
-            int ret = drainCompletionBatch(ofi_req->cq, ofi_req->wr_id);
+            int ret = drainCompletionBatch(cq, ofi_req->wr_id);
 
             if (ret == -FI_EAGAIN) {
                 std::this_thread::sleep_for(std::chrono::microseconds(200));
             } else if (ret == -FI_EAVAIL) {
-                if (!handleErrorCompletion(ofi_req->cq, ofi_req->wr_id)) {
+                if (!handleErrorCompletion(cq, ofi_req->wr_id)) {
                     break;
                 }
             } else if (ret < 0) {
@@ -1362,6 +1382,9 @@ nixl_status_t nixlOfiEngine::releaseReqH(nixlBackendReqH* handle) const {
             NIXL_DEBUG << "Successfully drained all operations after " << drain_attempts << " attempts";
         }
     }
+
+    // release cq reference
+    releaseCQ(cq);
 
     delete ofi_req;
     return NIXL_SUCCESS;
@@ -2069,6 +2092,26 @@ nixl_status_t nixlOfiEngine::registerSynapseAIMemoryExplicit(const nixlBlobDesc 
     
     NIXL_INFO << "successfully registered SynapseAI memory via dmabuf";
     return NIXL_SUCCESS;
+}
+
+// cq reference counting to prevent destructor race
+fid_cq* nixlOfiEngine::acquireCQ() const {
+    std::lock_guard<std::mutex> lock(cq_mutex_);
+    if (shutdownFlag_.load() || !cq_) {
+        return nullptr;  // cq not available or shutting down
+    }
+    cq_refcount_.fetch_add(1);
+    return cq_;
+}
+
+void nixlOfiEngine::releaseCQ(fid_cq* cq) const {
+    if (!cq) return;
+
+    std::lock_guard<std::mutex> lock(cq_mutex_);
+    int old_count = cq_refcount_.fetch_sub(1);
+    NIXL_DEBUG << "releaseCQ: refcount decremented from " << old_count << " to " << (old_count - 1);
+
+    // note: destructor will wait for refcount to reach 0 before closing cq
 }
 
 
