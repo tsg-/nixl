@@ -119,6 +119,11 @@ public:
     nixl_status_t genNotif(const std::string &remote_agent, const std::string &msg) const override;
 
 private:
+    // helper functions for releaseReqH
+    void atomicDecrementCompletions(std::atomic<uint64_t>& counter, uint64_t count) const;
+    bool handleErrorCompletion(fid_cq* cq, std::atomic<uint64_t>& pending_ops) const;
+    int drainCompletionBatch(fid_cq* cq, std::atomic<uint64_t>& pending_ops) const;
+
     // type definitions and nested classes
     struct ProviderConfig {
         std::string name;
